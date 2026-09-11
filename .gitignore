@@ -10,7 +10,7 @@ __pycache__/
 # Evaluation outputs & caches
 results/*
 !results/.gitkeep
-data/
+/data/
 *.mp4
 *.avi
 .ipynb_checkpoints/
