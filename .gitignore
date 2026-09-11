@@ -1,0 +1,17 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch checkpoints (Uncomment if using Git LFS or download script instead of committing checkpoints directly)
+# checkpoints/*.pth.tar
+# checkpoints/*.pth
+
+# Evaluation outputs & caches
+results/*
+!results/.gitkeep
+data/
+*.mp4
+*.avi
+.ipynb_checkpoints/
+.DS_Store

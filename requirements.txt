@@ -1,0 +1,12 @@
+timm==0.9.10
+easydict
+pyyaml
+opencv-python-headless
+lmdb
+scipy
+numpy<2.0
+gdown
+pandas
+tqdm
+yacs
+thop

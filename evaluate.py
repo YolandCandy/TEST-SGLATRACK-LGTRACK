@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Script Benchmark Đánh giá Toàn bộ Dataset (UAV123 & UAV-Anti-UAV)
+Hỗ trợ cả 2 mô hình: SGLATrack (CVPR 2025) & LGTrack
+LƯU Ý: Chỉ xuất tọa độ bounding box (.txt) và bảng chỉ số (Precision, AUC, FPS), KHÔNG XUẤT VIDEO.
+"""
+
+import os
+import sys
+import time
+import json
+import csv
+import glob
+import math
+import argparse
+import numpy as np
+import cv2
+import torch
+from tqdm import tqdm
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def compute_iou(box1, box2):
+    """box: [x, y, w, h]"""
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+    xi1, yi1 = max(x1, x2), max(y1, y2)
+    xi2, yi2 = min(x1 + w1, x2 + w2), min(y1 + h1, y2 + h2)
+    inter = max(0.0, xi2 - xi1) * max(0.0, yi2 - yi1)
+    union = w1 * h1 + w2 * h2 - inter
+    return float(inter / union) if union > 0 else 0.0
+
+def compute_cle(box1, box2):
+    """Center Location Error in pixels"""
+    c1 = (box1[0] + box1[2] / 2.0, box1[1] + box1[3] / 2.0)
+    c2 = (box2[0] + box2[2] / 2.0, box2[1] + box2[3] / 2.0)
+    return float(math.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2))
+
+def compute_success_auc(ious, thresholds=np.linspace(0, 1, 21)):
+    """AUC của Success Rate trên 21 ngưỡng [0, 1]"""
+    if len(ious) == 0:
+        return 0.0
+    rates = [np.mean([1.0 if u >= th else 0.0 for u in ious]) for th in thresholds]
+    return float(np.mean(rates))
+
+def get_sglatrack(checkpoint_path=None):
+    sgla_root = os.path.join(ROOT_DIR, 'SGLATrack')
+    lg_root = os.path.join(ROOT_DIR, 'LGTrack')
+    for mod in list(sys.modules.keys()):
+        if mod == 'lib' or mod.startswith('lib.'):
+            del sys.modules[mod]
+    while lg_root in sys.path:
+        sys.path.remove(lg_root)
+    while sgla_root in sys.path:
+        sys.path.remove(sgla_root)
+    sys.path.insert(0, sgla_root)
+
+    from lib.test.tracker.sglatrack import sglatrack
+    from lib.test.parameter.sglatrack import parameters
+
+    params = parameters('deit_distilled')
+    if checkpoint_path is None:
+        checkpoint_path = os.path.join(ROOT_DIR, 'checkpoints', 'sglatrack_ep0297.pth.tar')
+    params.checkpoint = checkpoint_path
+    params.debug = False
+    params.save_all_boxes = False
+    tracker = sglatrack(params, 'uav')
+    return tracker
+
+def get_lgtrack(checkpoint_path=None):
+    sgla_root = os.path.join(ROOT_DIR, 'SGLATrack')
+    lg_root = os.path.join(ROOT_DIR, 'LGTrack')
+    for mod in list(sys.modules.keys()):
+        if mod == 'lib' or mod.startswith('lib.'):
+            del sys.modules[mod]
+    while sgla_root in sys.path:
+        sys.path.remove(sgla_root)
+    while lg_root in sys.path:
+        sys.path.remove(lg_root)
+    sys.path.insert(0, lg_root)
+
+    from lib.test.tracker.lgtrack import LGTrack
+    from lib.test.parameter.lgtrack import parameters
+
+    params = parameters('deit_tiny_patch16_224')
+    if checkpoint_path is None:
+        checkpoint_path = os.path.join(ROOT_DIR, 'checkpoints', 'LGTrack_ep0300.pth.tar')
+    params.checkpoint = checkpoint_path
+    params.debug = False
+    params.save_all_boxes = False
+    tracker = LGTrack(params, 'uav')
+    return tracker
+
+def parse_groundtruth(gt_file):
+    boxes = []
+    if not os.path.exists(gt_file):
+        return []
+    with open(gt_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = [float(p.replace(',', ' ').strip()) for p in line.replace(',', ' ').split() if p.strip()]
+            if len(parts) >= 4:
+                boxes.append(parts[:4])
+    return boxes
+
+def parse_absent(absent_file):
+    if not os.path.exists(absent_file):
+        return None
+    absents = []
+    with open(absent_file, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                absents.append(int(line))
+    return absents
+
+def run_tracker_on_sequence(tracker, seq_info):
+    img_files = seq_info.get('img_files', [])
+    video_file = seq_info.get('video_file', None)
+    gt_boxes = seq_info['gt_boxes']
+    start_frame = seq_info.get('start_frame', 0)
+    end_frame = seq_info.get('end_frame', len(gt_boxes))
+
+    cap = None
+    if not img_files and video_file:
+        cap = cv2.VideoCapture(video_file)
+        for _ in range(start_frame):
+            cap.read()
+        ret, first_img = cap.read()
+        if not ret:
+            return None, None
+    elif img_files:
+        first_img = cv2.imread(img_files[start_frame])
+    else:
+        return None, None
+
+    init_box = [float(v) for v in gt_boxes[0]]
+    first_img_rgb = cv2.cvtColor(first_img, cv2.COLOR_BGR2RGB)
+    tracker.initialize(first_img_rgb, {'init_bbox': init_box})
+
+    total_frames = end_frame - start_frame
+    pred_boxes = [init_box]
+    frame_times = [0.0]
+
+    for idx in range(1, total_frames):
+        curr_frame_idx = start_frame + idx
+        if img_files:
+            frame = cv2.imread(img_files[curr_frame_idx])
+        else:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                break
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        t0 = time.time()
+        out = tracker.track(frame_rgb)
+        t_el = time.time() - t0
+        box = [float(v) for v in out['target_bbox']]
+        pred_boxes.append(box)
+        frame_times.append(t_el)
+
+    if cap:
+        cap.release()
+    return pred_boxes, frame_times
+
+def evaluate_predictions(pred_boxes, gt_boxes, absent_flags=None):
+    ious, cles = [], []
+    total = min(len(pred_boxes), len(gt_boxes))
+    for i in range(total):
+        if absent_flags and i < len(absent_flags) and absent_flags[i] == 1:
+            continue
+        gt = gt_boxes[i]
+        if len(gt) < 4 or gt[2] <= 0 or gt[3] <= 0:
+            continue
+        pr = pred_boxes[i]
+        ious.append(compute_iou(pr, gt))
+        cles.append(compute_cle(pr, gt))
+
+    prec20 = float(np.mean([1.0 if c <= 20.0 else 0.0 for c in cles]) * 100.0) if cles else 0.0
+    auc = float(compute_success_auc(ious) * 100.0) if ious else 0.0
+    mean_iou = float(np.mean(ious)) if ious else 0.0
+    return prec20, auc, mean_iou, len(ious)
+
+def save_tracking_results(out_file, pred_boxes):
+    os.makedirs(os.path.dirname(out_file), exist_ok=True)
+    with open(out_file, 'w') as f:
+        for b in pred_boxes:
+            f.write(f"{b[0]:.2f},{b[1]:.2f},{b[2]:.2f},{b[3]:.2f}\n")
+
+def find_datasets(base_path):
+    """Tìm đường dẫn các tập dữ liệu tại các vị trí phổ biến trên máy/Colab"""
+    paths = {
+        "UAV123": None,
+        "UAV-Anti-UAV": None
+    }
+    search_dirs = [
+        base_path,
+        os.path.join(ROOT_DIR, 'data'),
+        '/home/nvidia/datasets',
+        '/content/datasets',
+        '/content/data',
+        '/content/drive/MyDrive/datasets',
+        '/content/drive/MyDrive'
+    ]
+    for d in search_dirs:
+        if not d or not os.path.exists(d):
+            continue
+        # UAV123
+        p1 = os.path.join(d, 'UAV123')
+        if os.path.exists(p1) and os.path.exists(os.path.join(p1, 'data_seq')) and not paths["UAV123"]:
+            paths["UAV123"] = p1
+        # Anti-UAV
+        p2 = os.path.join(d, 'UAV-Anti-UAV')
+        if os.path.exists(p2) and (os.path.exists(os.path.join(p2, 'Test')) or os.path.exists(os.path.join(p2, 'Train'))) and not paths["UAV-Anti-UAV"]:
+            paths["UAV-Anti-UAV"] = p2
+
+    return paths
+
+def load_uav123_sequences(dataset_root, max_seqs=None):
+    anno_dir = os.path.join(dataset_root, 'anno', 'UAV123')
+    if not os.path.exists(anno_dir):
+        anno_dir = os.path.join(dataset_root, 'anno')
+    seq_dir = os.path.join(dataset_root, 'data_seq', 'UAV123')
+    if not os.path.exists(seq_dir):
+        seq_dir = os.path.join(dataset_root, 'data_seq')
+
+    anno_files = sorted(glob.glob(os.path.join(anno_dir, '*.txt')))
+    seqs = []
+    for af in anno_files:
+        seq_name = os.path.splitext(os.path.basename(af))[0]
+        video_name = seq_name.split('_')[0]
+        # Match sequence directory
+        cand_dir = os.path.join(seq_dir, video_name)
+        if not os.path.exists(cand_dir):
+            cand_dir = os.path.join(seq_dir, seq_name)
+        if not os.path.exists(cand_dir):
+            continue
+        imgs = sorted(glob.glob(os.path.join(cand_dir, '*.jpg')) or glob.glob(os.path.join(cand_dir, '*.png')))
+        if not imgs:
+            continue
+        gts = parse_groundtruth(af)
+        if not gts:
+            continue
+        seqs.append({
+            "name": seq_name,
+            "img_files": imgs,
+            "gt_boxes": gts,
+            "start_frame": 0,
+            "end_frame": min(len(imgs), len(gts))
+        })
+    if max_seqs and max_seqs > 0:
+        seqs = seqs[:max_seqs]
+    return seqs
+
+def load_antiuav_sequences(dataset_root, split="Test", max_seqs=None):
+    split_dir = os.path.join(dataset_root, split)
+    if not os.path.exists(split_dir):
+        split_dir = dataset_root
+    seq_dirs = sorted([os.path.join(split_dir, d) for d in os.listdir(split_dir) if os.path.isdir(os.path.join(split_dir, d)) and 'Test' in d or 'Train' in d])
+    seqs = []
+    for sd in seq_dirs:
+        sname = os.path.basename(sd)
+        vfiles = glob.glob(os.path.join(sd, '*.mp4')) or glob.glob(os.path.join(sd, '*.avi'))
+        gt_file = os.path.join(sd, 'groundtruth_rect.txt')
+        absent_file = os.path.join(sd, 'absent.txt')
+        if not vfiles or not os.path.exists(gt_file):
+            continue
+        gts = parse_groundtruth(gt_file)
+        absents = parse_absent(absent_file)
+        if not gts:
+            continue
+        seqs.append({
+            "name": sname,
+            "video_file": vfiles[0],
+            "gt_boxes": gts,
+            "absent_flags": absents,
+            "start_frame": 0,
+            "end_frame": len(gts)
+        })
+    if max_seqs and max_seqs > 0:
+        seqs = seqs[:max_seqs]
+    return seqs
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate SGLATrack & LGTrack on UAV Datasets")
+    parser.add_argument('--dataset', type=str, default='all', choices=['all', 'uav123', 'anti_uav'], help='Dataset cần đánh giá')
+    parser.add_argument('--data_dir', type=str, default='', help='Thư mục gốc chứa datasets')
+    parser.add_argument('--max_seqs', type=int, default=0, help='Giới hạn số sequence (0 = toàn bộ)')
+    parser.add_argument('--models', type=str, default='all', choices=['all', 'sglatrack', 'lgtrack'], help='Mô hình đánh giá')
+    parser.add_argument('--output_dir', type=str, default=os.path.join(ROOT_DIR, 'results'), help='Thư mục lưu kết quả')
+    args = parser.parse_args()
+
+    # Tối ưu hóa PyTorch trên GPU
+    torch.backends.cudnn.enabled = False
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[*] Thiết bị suy luận: {device}")
+    if device == "cuda":
+        print(f"[*] Tên GPU: {torch.cuda.get_device_name(0)}")
+
+    # Xác định đường dẫn datasets
+    ds_paths = find_datasets(args.data_dir)
+    print(f"[*] Đường dẫn UAV123: {ds_paths['UAV123']}")
+    print(f"[*] Đường dẫn UAV-Anti-UAV: {ds_paths['UAV-Anti-UAV']}")
+
+    datasets_to_run = []
+    if args.dataset in ['all', 'uav123']:
+        if ds_paths['UAV123']:
+            uav123_seqs = load_uav123_sequences(ds_paths['UAV123'], max_seqs=args.max_seqs)
+            datasets_to_run.append(("UAV123", uav123_seqs))
+        else:
+            print("[!] Không tìm thấy tập UAV123!")
+
+    if args.dataset in ['all', 'anti_uav']:
+        if ds_paths['UAV-Anti-UAV']:
+            anti_seqs = load_antiuav_sequences(ds_paths['UAV-Anti-UAV'], split="Test", max_seqs=args.max_seqs)
+            datasets_to_run.append(("UAV-Anti-UAV", anti_seqs))
+        else:
+            print("[!] Không tìm thấy tập UAV-Anti-UAV!")
+
+    models_to_run = []
+    if args.models in ['all', 'sglatrack']:
+        models_to_run.append(("SGLATrack", get_sglatrack))
+    if args.models in ['all', 'lgtrack']:
+        models_to_run.append(("LGTrack", get_lgtrack))
+
+    results_raw = []
+    summary = {}
+
+    for dname, seq_list in datasets_to_run:
+        print(f"\n=======================================================")
+        print(f"ĐANG ĐÁNH GIÁ TẬP DỮ LIỆU: {dname} ({len(seq_list)} chuỗi)")
+        print(f"=======================================================")
+        summary[dname] = {}
+
+        for mname, model_fn in models_to_run:
+            print(f"\n---> Khởi động mô hình: {mname} trên {dname}...")
+            tracker = model_fn()
+            
+            p_list, a_list, iou_list, fps_list = [], [], [], []
+            pbar = tqdm(seq_list, desc=f"[{mname}] {dname}")
+
+            for sinfo in pbar:
+                sname = sinfo['name']
+                # Tracking inference
+                pred_boxes, frame_times = run_tracker_on_sequence(tracker, sinfo)
+                if pred_boxes is None:
+                    continue
+
+                # Lưu bounding box kết quả dạng file .txt chuẩn
+                txt_out = os.path.join(args.output_dir, 'tracking_results', mname, dname, f"{sname}.txt")
+                save_tracking_results(txt_out, pred_boxes)
+
+                # Đánh giá chỉ số
+                prec20, auc, mean_iou, valid_n = evaluate_predictions(pred_boxes, sinfo['gt_boxes'], sinfo.get('absent_flags'))
+                avg_fps = float(1.0 / np.mean(frame_times[1:])) if len(frame_times) > 1 else 0.0
+
+                p_list.append(prec20)
+                a_list.append(auc)
+                iou_list.append(mean_iou)
+                fps_list.append(avg_fps)
+
+                pbar.set_postfix({"Prec@20": f"{prec20:.1f}%", "AUC": f"{auc:.1f}%", "FPS": f"{avg_fps:.1f}"})
+
+                results_raw.append({
+                    "Dataset": dname,
+                    "Sequence": sname,
+                    "Model": mname,
+                    "Frames": valid_n,
+                    "Precision_20px": round(prec20, 2),
+                    "Success_AUC": round(auc, 2),
+                    "Mean_IoU": round(mean_iou, 3),
+                    "FPS": round(avg_fps, 1),
+                    "BBox_Path": txt_out
+                })
+
+            summary[dname][mname] = {
+                "Mean_Precision_20px": round(float(np.mean(p_list)), 2) if p_list else 0.0,
+                "Mean_Success_AUC": round(float(np.mean(a_list)), 2) if a_list else 0.0,
+                "Mean_IoU": round(float(np.mean(iou_list)), 3) if iou_list else 0.0,
+                "Mean_FPS": round(float(np.mean(fps_list)), 1) if fps_list else 0.0,
+                "Total_Sequences": len(p_list)
+            }
+
+    # Xuất báo cáo CSV & JSON
+    os.makedirs(args.output_dir, exist_ok=True)
+    csv_file = os.path.join(args.output_dir, "metrics_summary.csv")
+    with open(csv_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Dataset", "Sequence", "Model", "Frames", "Precision_20px(%)", "Success_AUC(%)", "Mean_IoU", "FPS", "BBox_Path"])
+        for row in results_raw:
+            writer.writerow([row["Dataset"], row["Sequence"], row["Model"], row["Frames"],
+                             row["Precision_20px"], row["Success_AUC"], row["Mean_IoU"], row["FPS"], row["BBox_Path"]])
+
+    json_file = os.path.join(args.output_dir, "metrics_summary.json")
+    with open(json_file, 'w') as f:
+        json.dump({"summary": summary, "details": results_raw}, f, indent=2)
+
+    # In Bảng Tổng Kết
+    print("\n" + "="*70)
+    print("           TỔNG HỢP KẾT QUẢ BENCHMARK TRÊN CÁC TẬP DỮ LIỆU")
+    print("="*70)
+    for dname, dmodels in summary.items():
+        print(f"\n📁 Tập dữ liệu: {dname}")
+        print("-" * 65)
+        print(f"{'Mô hình':<15} | {'Prec@20px (%)':<15} | {'Success/AUC (%)':<15} | {'FPS':<10}")
+        print("-" * 65)
+        for mname, mmetrics in dmodels.items():
+            print(f"{mname:<15} | {mmetrics['Mean_Precision_20px']:<15.2f} | {mmetrics['Mean_Success_AUC']:<15.2f} | {mmetrics['Mean_FPS']:<10.1f}")
+        print("-" * 65)
+
+    print(f"\n[+] Đã lưu file tọa độ bounding box tại: {os.path.join(args.output_dir, 'tracking_results')}")
+    print(f"[+] Đã lưu báo cáo CSV chi tiết tại: {csv_file}")
+    print(f"[+] Đã lưu báo cáo JSON chi tiết tại: {json_file}")
+
+if __name__ == '__main__':
+    main()
