@@ -215,10 +215,14 @@ def find_datasets(base_path):
         p1 = os.path.join(d, 'UAV123')
         if os.path.exists(p1) and os.path.exists(os.path.join(p1, 'data_seq')) and not paths["UAV123"]:
             paths["UAV123"] = p1
+        elif os.path.exists(os.path.join(d, 'data_seq')) and not paths["UAV123"]:
+            paths["UAV123"] = d
         # Anti-UAV
         p2 = os.path.join(d, 'UAV-Anti-UAV')
         if os.path.exists(p2) and (os.path.exists(os.path.join(p2, 'Test')) or os.path.exists(os.path.join(p2, 'Train'))) and not paths["UAV-Anti-UAV"]:
             paths["UAV-Anti-UAV"] = p2
+        elif (os.path.exists(os.path.join(d, 'Test')) or os.path.exists(os.path.join(d, 'Train'))) and not paths["UAV-Anti-UAV"]:
+            paths["UAV-Anti-UAV"] = d
 
     return paths
 

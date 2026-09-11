@@ -62,10 +62,18 @@ if [ -d "/content" ]; then
             echo "[+] Tìm thấy $UAV_ZIP. Đang copy sang Colab SSD và giải nén..."
             cp "$UAV_ZIP" "$LOCAL_DS/"
             ZIP_NAME=$(basename "$UAV_ZIP")
-            unzip -q -o "$LOCAL_DS/$ZIP_NAME" -d "$LOCAL_DS/"
+            mkdir -p "$LOCAL_DS/UAV123"
+            unzip -q -o "$LOCAL_DS/$ZIP_NAME" -d "$LOCAL_DS/UAV123/"
             rm -f "$LOCAL_DS/$ZIP_NAME"
             echo "[+] Đã giải nén UAV123 thành công vào $LOCAL_DS/UAV123"
         fi
+    fi
+
+    # Tự động chuẩn hóa nếu data_seq nằm ở ngoài /content/datasets
+    if [ -d "$LOCAL_DS/data_seq" ] && [ ! -d "$LOCAL_DS/UAV123/data_seq" ]; then
+        mkdir -p "$LOCAL_DS/UAV123"
+        mv "$LOCAL_DS/data_seq" "$LOCAL_DS/UAV123/" 2>/dev/null || true
+        [ -d "$LOCAL_DS/anno" ] && mv "$LOCAL_DS/anno" "$LOCAL_DS/UAV123/" 2>/dev/null || true
     fi
 
     # 4.2 Kiểm tra UAV-Anti-UAV (Chỉ cần tập Test)
