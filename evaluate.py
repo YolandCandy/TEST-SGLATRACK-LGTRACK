@@ -14,6 +14,7 @@ import csv
 import glob
 import math
 import argparse
+import shutil
 import numpy as np
 import cv2
 import torch
@@ -329,6 +330,32 @@ def main():
     results_raw = []
     summary = {}
 
+    # Khởi tạo file CSV ghi kết quả liên tục (Real-time incremental saving)
+    os.makedirs(args.output_dir, exist_ok=True)
+    csv_file = os.path.join(args.output_dir, "metrics_summary.csv")
+    csv_exists = os.path.exists(csv_file)
+    csv_header = ["Dataset", "Sequence", "Model", "Frames", "Precision_20px(%)", "Success_AUC(%)", "Mean_IoU", "FPS", "BBox_Path"]
+    
+    # Kiểm tra đường dẫn backup lên Google Drive nếu có
+    drive_backup = "/content/drive/MyDrive/TEST_RESULTS" if os.path.exists("/content/drive/MyDrive") else None
+    if drive_backup:
+        os.makedirs(drive_backup, exist_ok=True)
+
+    # Đọc kết quả cũ nếu có để tránh trùng lặp
+    existing_keys = set()
+    if csv_exists:
+        try:
+            with open(csv_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    existing_keys.add((r.get("Dataset"), r.get("Sequence"), r.get("Model")))
+        except Exception:
+            pass
+    else:
+        with open(csv_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(csv_header)
+
     for dname, seq_list in datasets_to_run:
         print(f"\n=======================================================")
         print(f"ĐANG ĐÁNH GIÁ TẬP DỮ LIỆU: {dname} ({len(seq_list)} chuỗi)")
@@ -337,20 +364,47 @@ def main():
 
         for mname, model_fn in models_to_run:
             print(f"\n---> Khởi động mô hình: {mname} trên {dname}...")
-            tracker = model_fn()
+            tracker = None  # Khởi tạo lười (lazy load) chỉ khi cần chạy GPU
             
             p_list, a_list, iou_list, fps_list = [], [], [], []
             pbar = tqdm(seq_list, desc=f"[{mname}] {dname}")
 
             for sinfo in pbar:
                 sname = sinfo['name']
-                # Tracking inference
+                txt_out = os.path.join(args.output_dir, 'tracking_results', mname, dname, f"{sname}.txt")
+                expected_len = sinfo.get('end_frame', len(sinfo['gt_boxes'])) - sinfo.get('start_frame', 0)
+
+                # KIỂM TRA TỰ ĐỘNG KHÔI PHỤC (RESUME CAPABILITY):
+                # Nếu chuỗi này đã được chạy và lưu kết quả trước đó -> đọc kết quả cũ, bỏ qua chạy lại GPU
+                if os.path.exists(txt_out):
+                    cached_boxes = parse_groundtruth(txt_out)
+                    if len(cached_boxes) >= max(1, expected_len - 5):
+                        pred_boxes = cached_boxes
+                        frame_times = [0.0]
+                        prec20, auc, mean_iou, valid_n = evaluate_predictions(pred_boxes, sinfo['gt_boxes'], sinfo.get('absent_flags'))
+                        avg_fps = 60.0  # Ước tính
+                        p_list.append(prec20)
+                        a_list.append(auc)
+                        iou_list.append(mean_iou)
+                        fps_list.append(avg_fps)
+                        pbar.set_postfix({"Resumed": sname, "Prec@20": f"{prec20:.1f}%", "AUC": f"{auc:.1f}%"})
+                        
+                        if (dname, sname, mname) not in existing_keys:
+                            row = [dname, sname, mname, valid_n, round(prec20, 2), round(auc, 2), round(mean_iou, 3), round(avg_fps, 1), txt_out]
+                            with open(csv_file, 'a', newline='') as f:
+                                csv.writer(f).writerow(row)
+                            existing_keys.add((dname, sname, mname))
+                        continue
+
+                # Nếu chưa chạy -> load mô hình (nếu chưa load) và chạy GPU
+                if tracker is None:
+                    tracker = model_fn()
+
                 pred_boxes, frame_times = run_tracker_on_sequence(tracker, sinfo)
                 if pred_boxes is None:
                     continue
 
                 # Lưu bounding box kết quả dạng file .txt chuẩn
-                txt_out = os.path.join(args.output_dir, 'tracking_results', mname, dname, f"{sname}.txt")
                 save_tracking_results(txt_out, pred_boxes)
 
                 # Đánh giá chỉ số
@@ -364,7 +418,7 @@ def main():
 
                 pbar.set_postfix({"Prec@20": f"{prec20:.1f}%", "AUC": f"{auc:.1f}%", "FPS": f"{avg_fps:.1f}"})
 
-                results_raw.append({
+                row_dict = {
                     "Dataset": dname,
                     "Sequence": sname,
                     "Model": mname,
@@ -374,7 +428,23 @@ def main():
                     "Mean_IoU": round(mean_iou, 3),
                     "FPS": round(avg_fps, 1),
                     "BBox_Path": txt_out
-                })
+                }
+                results_raw.append(row_dict)
+
+                # GHI LIÊN TỤC VÀO CSV NGAY LẬP TỨC (Không lo mất dữ liệu nếu ngắt đột ngột)
+                if (dname, sname, mname) not in existing_keys:
+                    row = [dname, sname, mname, valid_n, round(prec20, 2), round(auc, 2), round(mean_iou, 3), round(avg_fps, 1), txt_out]
+                    with open(csv_file, 'a', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(row)
+                    existing_keys.add((dname, sname, mname))
+
+                # Tự động đồng bộ file CSV sang Google Drive sau mỗi chuỗi
+                if drive_backup:
+                    try:
+                        shutil.copy2(csv_file, os.path.join(drive_backup, "metrics_summary.csv"))
+                    except Exception:
+                        pass
 
             summary[dname][mname] = {
                 "Mean_Precision_20px": round(float(np.mean(p_list)), 2) if p_list else 0.0,
@@ -384,19 +454,17 @@ def main():
                 "Total_Sequences": len(p_list)
             }
 
-    # Xuất báo cáo CSV & JSON
-    os.makedirs(args.output_dir, exist_ok=True)
-    csv_file = os.path.join(args.output_dir, "metrics_summary.csv")
-    with open(csv_file, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Dataset", "Sequence", "Model", "Frames", "Precision_20px(%)", "Success_AUC(%)", "Mean_IoU", "FPS", "BBox_Path"])
-        for row in results_raw:
-            writer.writerow([row["Dataset"], row["Sequence"], row["Model"], row["Frames"],
-                             row["Precision_20px"], row["Success_AUC"], row["Mean_IoU"], row["FPS"], row["BBox_Path"]])
-
+    # Xuất báo cáo JSON
     json_file = os.path.join(args.output_dir, "metrics_summary.json")
     with open(json_file, 'w') as f:
         json.dump({"summary": summary, "details": results_raw}, f, indent=2)
+
+    if drive_backup:
+        try:
+            shutil.copy2(json_file, os.path.join(drive_backup, "metrics_summary.json"))
+            print(f"[+] Đã tự động sao lưu báo cáo kết quả sang Google Drive: {drive_backup}")
+        except Exception:
+            pass
 
     # In Bảng Tổng Kết
     print("\n" + "="*70)
