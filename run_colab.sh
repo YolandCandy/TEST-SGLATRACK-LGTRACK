@@ -49,16 +49,23 @@ if [ -d "/content" ]; then
     
     # 4.1 Kiểm tra UAV123
     if [ ! -d "$LOCAL_DS/UAV123" ]; then
+        UAV_ZIP=""
         for d in "${DRIVE_CANDIDATES[@]}"; do
-            if [ -f "$d/UAV123.zip" ]; then
-                echo "[+] Tìm thấy $d/UAV123.zip. Đang copy sang Colab SSD và giải nén..."
-                cp "$d/UAV123.zip" "$LOCAL_DS/"
-                unzip -q -o "$LOCAL_DS/UAV123.zip" -d "$LOCAL_DS/"
-                rm -f "$LOCAL_DS/UAV123.zip"
-                echo "[+] Đã giải nén UAV123 thành công vào $LOCAL_DS/UAV123"
-                break
-            fi
+            for f in "$d/UAV123/UAV123.zip" "$d/UAV123.zip" "$d/UAV123/"*.zip "$d/"*UAV123*.zip; do
+                if [ -f "$f" ]; then
+                    UAV_ZIP="$f"
+                    break 2
+                fi
+            done
         done
+        if [ -n "$UAV_ZIP" ]; then
+            echo "[+] Tìm thấy $UAV_ZIP. Đang copy sang Colab SSD và giải nén..."
+            cp "$UAV_ZIP" "$LOCAL_DS/"
+            ZIP_NAME=$(basename "$UAV_ZIP")
+            unzip -q -o "$LOCAL_DS/$ZIP_NAME" -d "$LOCAL_DS/"
+            rm -f "$LOCAL_DS/$ZIP_NAME"
+            echo "[+] Đã giải nén UAV123 thành công vào $LOCAL_DS/UAV123"
+        fi
     fi
 
     # 4.2 Kiểm tra UAV-Anti-UAV (Chỉ cần tập Test)
