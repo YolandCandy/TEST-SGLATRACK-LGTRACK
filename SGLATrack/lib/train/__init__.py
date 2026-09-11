@@ -1,1 +1,4 @@
-from .admin.multigpu import MultiGPU
+try:
+    from .admin.multigpu import MultiGPU
+except Exception:
+    pass

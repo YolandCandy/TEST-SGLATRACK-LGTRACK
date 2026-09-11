@@ -3,3 +3,4 @@ easydict
 yacs
 lmdb
 thop
+tensorboardX

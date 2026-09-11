@@ -2,9 +2,19 @@ import os
 from collections import OrderedDict
 try:
     from torch.utils.tensorboard import SummaryWriter
-except:
-    print('WARNING: You are using tensorboardX instead sis you have a too old pytorch version.')
-    from tensorboardX import SummaryWriter
+except Exception:
+    try:
+        from tensorboardX import SummaryWriter
+    except Exception:
+        class SummaryWriter:
+            def __init__(self, *args, **kwargs):
+                pass
+            def add_text(self, *args, **kwargs):
+                pass
+            def add_scalar(self, *args, **kwargs):
+                pass
+            def close(self):
+                pass
 
 
 class TensorboardWriter:
