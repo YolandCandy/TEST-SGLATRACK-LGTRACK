@@ -203,6 +203,8 @@ def find_datasets(base_path):
         '/home/nvidia/datasets',
         '/content/datasets',
         '/content/data',
+        '/content/drive/MyDrive/tracking/datasets',
+        '/content/drive/MyDrive/tracking',
         '/content/drive/MyDrive/datasets',
         '/content/drive/MyDrive'
     ]

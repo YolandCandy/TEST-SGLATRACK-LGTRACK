@@ -37,37 +37,41 @@ echo "[3/4] Tìm kiếm và chuẩn bị tập dữ liệu..."
 
 # Tự động phát hiện và giải nén nếu dữ liệu nằm ở dạng file zip trên Drive sang ổ cứng Colab (/content/datasets)
 LOCAL_DS="/content/datasets"
-DRIVE_DS="/content/drive/MyDrive/datasets"
+DRIVE_CANDIDATES=(
+    "/content/drive/MyDrive/tracking/datasets"
+    "/content/drive/MyDrive/tracking"
+    "/content/drive/MyDrive/datasets"
+    "/content/drive/MyDrive"
+)
 
 if [ -d "/content" ]; then
     mkdir -p "$LOCAL_DS"
     
     # 4.1 Kiểm tra UAV123
     if [ ! -d "$LOCAL_DS/UAV123" ]; then
-        if [ -f "$DRIVE_DS/UAV123.zip" ]; then
-            echo "[+] Tìm thấy $DRIVE_DS/UAV123.zip. Đang copy sang Colab SSD và giải nén..."
-            cp "$DRIVE_DS/UAV123.zip" "$LOCAL_DS/"
-            unzip -q -o "$LOCAL_DS/UAV123.zip" -d "$LOCAL_DS/"
-            rm -f "$LOCAL_DS/UAV123.zip"
-            echo "[+] Đã giải nén UAV123 thành công vào $LOCAL_DS/UAV123"
-        elif [ -f "/content/drive/MyDrive/UAV123.zip" ]; then
-            echo "[+] Tìm thấy /content/drive/MyDrive/UAV123.zip. Đang copy sang Colab SSD và giải nén..."
-            cp "/content/drive/MyDrive/UAV123.zip" "$LOCAL_DS/"
-            unzip -q -o "$LOCAL_DS/UAV123.zip" -d "$LOCAL_DS/"
-            rm -f "$LOCAL_DS/UAV123.zip"
-            echo "[+] Đã giải nén UAV123 thành công vào $LOCAL_DS/UAV123"
-        fi
+        for d in "${DRIVE_CANDIDATES[@]}"; do
+            if [ -f "$d/UAV123.zip" ]; then
+                echo "[+] Tìm thấy $d/UAV123.zip. Đang copy sang Colab SSD và giải nén..."
+                cp "$d/UAV123.zip" "$LOCAL_DS/"
+                unzip -q -o "$LOCAL_DS/UAV123.zip" -d "$LOCAL_DS/"
+                rm -f "$LOCAL_DS/UAV123.zip"
+                echo "[+] Đã giải nén UAV123 thành công vào $LOCAL_DS/UAV123"
+                break
+            fi
+        done
     fi
 
     # 4.2 Kiểm tra UAV-Anti-UAV (Chỉ cần tập Test)
     if [ ! -d "$LOCAL_DS/UAV-Anti-UAV/Test" ]; then
         mkdir -p "$LOCAL_DS/UAV-Anti-UAV"
         ANTI_ZIP=""
-        for f in "$DRIVE_DS/UAV-Anti-UAV/"Test*.zip "$DRIVE_DS/UAV-Anti-UAV/"test*.zip "$DRIVE_DS/"Test*.zip "$DRIVE_DS/"test*.zip; do
-            if [ -f "$f" ]; then
-                ANTI_ZIP="$f"
-                break
-            fi
+        for d in "${DRIVE_CANDIDATES[@]}"; do
+            for f in "$d/UAV-Anti-UAV/"Test*.zip "$d/UAV-Anti-UAV/"test*.zip "$d/"Test*.zip "$d/"test*.zip; do
+                if [ -f "$f" ]; then
+                    ANTI_ZIP="$f"
+                    break 2
+                fi
+            done
         done
         if [ -n "$ANTI_ZIP" ]; then
             echo "[+] Tìm thấy $ANTI_ZIP. Đang copy sang Colab SSD và giải nén..."
@@ -83,6 +87,8 @@ fi
 DATA_DIR=""
 POSSIBLE_DIRS=(
     "/content/datasets"
+    "/content/drive/MyDrive/tracking/datasets"
+    "/content/drive/MyDrive/tracking"
     "/content/drive/MyDrive/datasets"
     "/content/drive/MyDrive"
     "/content/data"
