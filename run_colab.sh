@@ -48,7 +48,16 @@ if [ -d "/content" ]; then
     mkdir -p "$LOCAL_DS"
     
     # 4.1 Kiểm tra UAV123
-    if [ ! -d "$LOCAL_DS/UAV123" ]; then
+    # Chuẩn hóa nếu data_seq nằm ở ngoài /content/datasets
+    if [ -d "$LOCAL_DS/data_seq" ] && [ ! -d "$LOCAL_DS/UAV123/data_seq" ]; then
+        mkdir -p "$LOCAL_DS/UAV123"
+        mv "$LOCAL_DS/data_seq" "$LOCAL_DS/UAV123/" 2>/dev/null || true
+        [ -d "$LOCAL_DS/anno" ] && mv "$LOCAL_DS/anno" "$LOCAL_DS/UAV123/" 2>/dev/null || true
+    fi
+
+    if [ -d "$LOCAL_DS/UAV123/data_seq" ] || [ -d "$LOCAL_DS/UAV123" -a -n "$(ls -A $LOCAL_DS/UAV123 2>/dev/null)" ]; then
+        echo "[+] Tập dữ liệu UAV123 đã được giải nén sẵn. Bỏ qua bước copy & giải nén."
+    else
         UAV_ZIP=""
         for d in "${DRIVE_CANDIDATES[@]}"; do
             for f in "$d/UAV123/UAV123.zip" "$d/UAV123.zip" "$d/UAV123/"*.zip "$d/"*UAV123*.zip; do
@@ -69,15 +78,10 @@ if [ -d "/content" ]; then
         fi
     fi
 
-    # Tự động chuẩn hóa nếu data_seq nằm ở ngoài /content/datasets
-    if [ -d "$LOCAL_DS/data_seq" ] && [ ! -d "$LOCAL_DS/UAV123/data_seq" ]; then
-        mkdir -p "$LOCAL_DS/UAV123"
-        mv "$LOCAL_DS/data_seq" "$LOCAL_DS/UAV123/" 2>/dev/null || true
-        [ -d "$LOCAL_DS/anno" ] && mv "$LOCAL_DS/anno" "$LOCAL_DS/UAV123/" 2>/dev/null || true
-    fi
-
     # 4.2 Kiểm tra UAV-Anti-UAV (Chỉ cần tập Test)
-    if [ ! -d "$LOCAL_DS/UAV-Anti-UAV/Test" ]; then
+    if [ -d "$LOCAL_DS/UAV-Anti-UAV/Test" -a -n "$(ls -A $LOCAL_DS/UAV-Anti-UAV/Test 2>/dev/null)" ]; then
+        echo "[+] Tập dữ liệu UAV-Anti-UAV Test đã được giải nén sẵn. Bỏ qua bước copy & giải nén."
+    else
         mkdir -p "$LOCAL_DS/UAV-Anti-UAV"
         ANTI_ZIP=""
         for d in "${DRIVE_CANDIDATES[@]}"; do
