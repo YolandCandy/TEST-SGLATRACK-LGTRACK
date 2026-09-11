@@ -31,14 +31,60 @@ echo ""
 echo "[2/4] Kiểm tra checkpoints trọng số..."
 bash checkpoints/download_weights.sh
 
-# 4. Kiểm tra dữ liệu
+# 4. Kiểm tra và chuẩn bị dữ liệu
 echo ""
-echo "[3/4] Tìm kiếm tập dữ liệu..."
+echo "[3/4] Tìm kiếm và chuẩn bị tập dữ liệu..."
+
+# Tự động phát hiện và giải nén nếu dữ liệu nằm ở dạng file zip trên Drive sang ổ cứng Colab (/content/datasets)
+LOCAL_DS="/content/datasets"
+DRIVE_DS="/content/drive/MyDrive/datasets"
+
+if [ -d "/content" ]; then
+    mkdir -p "$LOCAL_DS"
+    
+    # 4.1 Kiểm tra UAV123
+    if [ ! -d "$LOCAL_DS/UAV123" ]; then
+        if [ -f "$DRIVE_DS/UAV123.zip" ]; then
+            echo "[+] Tìm thấy $DRIVE_DS/UAV123.zip. Đang copy sang Colab SSD và giải nén..."
+            cp "$DRIVE_DS/UAV123.zip" "$LOCAL_DS/"
+            unzip -q -o "$LOCAL_DS/UAV123.zip" -d "$LOCAL_DS/"
+            rm -f "$LOCAL_DS/UAV123.zip"
+            echo "[+] Đã giải nén UAV123 thành công vào $LOCAL_DS/UAV123"
+        elif [ -f "/content/drive/MyDrive/UAV123.zip" ]; then
+            echo "[+] Tìm thấy /content/drive/MyDrive/UAV123.zip. Đang copy sang Colab SSD và giải nén..."
+            cp "/content/drive/MyDrive/UAV123.zip" "$LOCAL_DS/"
+            unzip -q -o "$LOCAL_DS/UAV123.zip" -d "$LOCAL_DS/"
+            rm -f "$LOCAL_DS/UAV123.zip"
+            echo "[+] Đã giải nén UAV123 thành công vào $LOCAL_DS/UAV123"
+        fi
+    fi
+
+    # 4.2 Kiểm tra UAV-Anti-UAV (Chỉ cần tập Test)
+    if [ ! -d "$LOCAL_DS/UAV-Anti-UAV/Test" ]; then
+        mkdir -p "$LOCAL_DS/UAV-Anti-UAV"
+        ANTI_ZIP=""
+        for f in "$DRIVE_DS/UAV-Anti-UAV/"Test*.zip "$DRIVE_DS/UAV-Anti-UAV/"test*.zip "$DRIVE_DS/"Test*.zip "$DRIVE_DS/"test*.zip; do
+            if [ -f "$f" ]; then
+                ANTI_ZIP="$f"
+                break
+            fi
+        done
+        if [ -n "$ANTI_ZIP" ]; then
+            echo "[+] Tìm thấy $ANTI_ZIP. Đang copy sang Colab SSD và giải nén..."
+            cp "$ANTI_ZIP" "$LOCAL_DS/"
+            ZIP_NAME=$(basename "$ANTI_ZIP")
+            unzip -q -o "$LOCAL_DS/$ZIP_NAME" -d "$LOCAL_DS/UAV-Anti-UAV/"
+            rm -f "$LOCAL_DS/$ZIP_NAME"
+            echo "[+] Đã giải nén UAV-Anti-UAV Test thành công vào $LOCAL_DS/UAV-Anti-UAV/Test"
+        fi
+    fi
+fi
+
 DATA_DIR=""
 POSSIBLE_DIRS=(
+    "/content/datasets"
     "/content/drive/MyDrive/datasets"
     "/content/drive/MyDrive"
-    "/content/datasets"
     "/content/data"
     "/home/nvidia/datasets"
     "$DIR/data"
@@ -53,8 +99,8 @@ for d in "${POSSIBLE_DIRS[@]}"; do
 done
 
 if [ -z "$DATA_DIR" ]; then
-    echo "[!] Chưa thấy dữ liệu sẵn có trong các thư mục thông thường."
-    echo "[*] Gợi ý trên Colab: Bạn hãy mount Google Drive hoặc đặt dataset vào thư mục 'data/'"
+    echo "[!] Cảnh báo: Chưa thấy thư mục dữ liệu đã giải nén."
+    echo "[*] Vui lòng đảm bảo đã mount Drive hoặc đặt dữ liệu vào /content/datasets"
 fi
 
 # 5. Chạy benchmark đánh giá (CHỈ XUẤT BOUNDING BOX VÀ CHỈ SỐ, KHÔNG XUẤT VIDEO)
