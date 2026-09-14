@@ -203,7 +203,10 @@ def find_datasets(base_path):
     search_dirs = [
         base_path,
         os.path.join(ROOT_DIR, 'data'),
-        '/home/nvidia/datasets',
+        '/kaggle/input',
+        '/kaggle/working',
+        '/kaggle/working/datasets',
+        '/tmp/datasets',
         '/content/datasets',
         '/content/data',
         '/content/drive/MyDrive/tracking/datasets',
@@ -211,6 +214,13 @@ def find_datasets(base_path):
         '/content/drive/MyDrive/datasets',
         '/content/drive/MyDrive'
     ]
+    # Tự động duyệt tất cả các thư mục con trong /kaggle/input
+    if os.path.exists('/kaggle/input'):
+        for sub in os.listdir('/kaggle/input'):
+            sub_p = os.path.join('/kaggle/input', sub)
+            if os.path.isdir(sub_p) and sub_p not in search_dirs:
+                search_dirs.append(sub_p)
+
     for d in search_dirs:
         if not d or not os.path.exists(d):
             continue

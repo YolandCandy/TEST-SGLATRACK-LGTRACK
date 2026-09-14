@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# SCRIPT 1 BƯỚC DUY NHẤT CHẠY BENCHMARK TRÊN KAGGLE CHO TẬP UAV-ANTI-UAV
+# Sử dụng trên Kaggle Notebook:
+#   !bash run_kaggle.sh [--models all|sglatrack|lgtrack] [--max_seqs N]
+# ==============================================================================
+
+set -e
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+cd "$DIR"
+
+echo "=================================================================="
+echo "          KIỂM TRA HỆ THỐNG & CẤU HÌNH KAGGLE NOTEBOOK"
+echo "=================================================================="
+
+# 1. Kiểm tra GPU
+if command -v nvidia-smi &> /dev/null; then
+    echo "[*] GPU phát hiện:"
+    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+else
+    echo "[!] Cảnh báo: Không phát hiện GPU NVIDIA. Đang dùng CPU."
+fi
+
+# 2. Cài đặt thư viện phụ thuộc
+echo ""
+echo "[1/4] Đang cài đặt thư viện phụ thuộc..."
+pip install -q -r requirements.txt
+
+# 3. Kiểm tra và chuẩn bị trọng số mô hình
+echo ""
+echo "[2/4] Kiểm tra checkpoints trọng số..."
+# Tự động tải weights nếu chưa có
+if [ -f "$DIR/checkpoints/download_weights.sh" ]; then
+    bash "$DIR/checkpoints/download_weights.sh"
+fi
+
+# Cấu hình Torch Hub cache để sử dụng ngay weights local, không tải lại từ Facebook Research
+mkdir -p "$HOME/.cache/torch/hub/checkpoints"
+cp -n "$DIR/checkpoints/"*.pth "$HOME/.cache/torch/hub/checkpoints/" 2>/dev/null || true
+
+# 4. Tìm kiếm và chuẩn bị tập dữ liệu UAV-Anti-UAV
+echo ""
+echo "[3/4] Tìm kiếm tập dữ liệu UAV-Anti-UAV..."
+
+DATA_DIR=""
+
+# 4.1 Ưu tiên 1: Tìm xem dataset đã được add và giải nén sẵn trong /kaggle/input hay chưa
+if [ -d "/kaggle/input" ]; then
+    for d in /kaggle/input/* /kaggle/input/*/*; do
+        if [ -d "$d/Test" ] || [ -d "$d/Train" ] || [ -d "$d/UAV-Anti-UAV/Test" ]  || [ -d "$d/UAVAntiUAV-Test/Test" ]; then
+            DATA_DIR="$d"
+            echo "[+] Tìm thấy dataset đã giải nén sẵn tại: $DATA_DIR"
+            break
+        fi
+    done
+
+    # 4.2 Ưu tiên 2: Nếu chỉ có file .zip trong /kaggle/input, giải nén sang /tmp/datasets
+    if [ -z "$DATA_DIR" ]; then
+        ANTI_ZIP=""
+        for f in $(find /kaggle/input -name "*Anti-UAV*.zip" -o -name "*anti_uav*.zip" -o -name "*Test*.zip" 2>/dev/null); do
+            if [ -f "$f" ]; then
+                ANTI_ZIP="$f"
+                break
+            fi
+        done
+        if [ -n "$ANTI_ZIP" ]; then
+            echo "[+] Tìm thấy file zip tại: $ANTI_ZIP"
+            echo "[+] Đang giải nén sang /tmp/datasets/UAV-Anti-UAV..."
+            mkdir -p /tmp/datasets/UAV-Anti-UAV
+            unzip -q -o "$ANTI_ZIP" -d /tmp/datasets/UAV-Anti-UAV/
+            DATA_DIR="/tmp/datasets/UAV-Anti-UAV"
+            echo "[+] Giải nén hoàn tất vào: $DATA_DIR"
+        fi
+    fi
+fi
+
+# 4.3 Ưu tiên 3: Tìm kiếm tại các đường dẫn thông thường khác
+if [ -z "$DATA_DIR" ]; then
+    FALLBACK_DIRS=(
+        "/kaggle/working/datasets"
+        "/tmp/datasets"
+        "$DIR/data"
+        "/content/datasets"
+        "/home/nvidia/datasets"
+    )
+    for d in "${FALLBACK_DIRS[@]}"; do
+        if [ -d "$d/UAV-Anti-UAV" ] || [ -d "$d/Test" ]; then
+            DATA_DIR="$d"
+            echo "[+] Tìm thấy dataset tại: $DATA_DIR"
+            break
+        fi
+    done
+fi
+
+if [ -z "$DATA_DIR" ]; then
+    echo "[!] Cảnh báo: Không tự động tìm thấy thư mục UAV-Anti-UAV."
+    echo "[*] Gợi ý: Hãy bấm 'Add Data' trên Kaggle và thêm dataset UAV-Anti-UAV."
+    echo "[*] Hoặc truyền trực tiếp đường dẫn bằng cờ --data_dir /path/to/dataset."
+fi
+
+# Thiết lập thư mục lưu kết quả phù hợp với môi trường Kaggle
+OUTPUT_DIR="/kaggle/working/results"
+if [ ! -d "/kaggle/working" ]; then
+    OUTPUT_DIR="$DIR/results"
+fi
+mkdir -p "$OUTPUT_DIR"
+
+# 5. Chạy benchmark đánh giá CHUYÊN BIỆT cho UAV-Anti-UAV
+echo ""
+echo "[4/4] Bắt đầu chạy benchmark đánh giá tập UAV-Anti-UAV..."
+python3 evaluate.py --dataset anti_uav --data_dir "$DATA_DIR" --output_dir "$OUTPUT_DIR" "$@"
+
+echo ""
+echo "=================================================================="
+echo "          HOÀN THÀNH ĐÁNH GIÁ TẬP DỮ LIỆU UAV-ANTI-UAV!"
+echo " Báo cáo kết quả được lưu tại: $OUTPUT_DIR"
+echo "=================================================================="
+
+# Nén tự động thư mục results để người dùng tải về 1-click trên Kaggle Output
+if [ -d "$OUTPUT_DIR" ] && [ -d "/kaggle/working" ]; then
+    cd /kaggle/working
+    zip -q -r benchmark_anti_uav_results.zip results/ 2>/dev/null || true
+    if [ -f "/kaggle/working/benchmark_anti_uav_results.zip" ]; then
+        echo "[+] Đã đóng gói sẵn file tải về: /kaggle/working/benchmark_anti_uav_results.zip"
+    fi
+fi
