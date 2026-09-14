@@ -238,6 +238,12 @@ def find_datasets(base_path):
             paths["UAV-Anti-UAV"] = p2
         elif (os.path.exists(os.path.join(d, 'Test')) or os.path.exists(os.path.join(d, 'Train'))) and not paths["UAV-Anti-UAV"]:
             paths["UAV-Anti-UAV"] = d
+        elif os.path.basename(d).lower() in ['test', 'train'] and not paths["UAV-Anti-UAV"]:
+            paths["UAV-Anti-UAV"] = d
+        elif not paths["UAV-Anti-UAV"] and os.path.isdir(d):
+            sub_dirs = [s for s in os.listdir(d) if os.path.isdir(os.path.join(d, s))]
+            if any('Test_' in s or 'Train_' in s or s.startswith('UAV-Anti-UAV') for s in sub_dirs):
+                paths["UAV-Anti-UAV"] = d
 
     return paths
 
@@ -360,34 +366,102 @@ def load_uav123_sequences(dataset_root, max_seqs=None):
     return seqs
 
 def load_antiuav_sequences(dataset_root, split="Test", max_seqs=None):
-    split_dir = os.path.join(dataset_root, split)
-    if not os.path.exists(split_dir):
+    # 1. Xác định thư mục split (chứa các sequence con)
+    direct_subs = [d for d in os.listdir(dataset_root) if os.path.isdir(os.path.join(dataset_root, d))] if os.path.exists(dataset_root) else []
+    has_direct_seqs = any("Test_" in d or "Train_" in d or d.startswith("UAV-Anti-UAV") for d in direct_subs)
+
+    if has_direct_seqs:
         split_dir = dataset_root
+    elif os.path.basename(dataset_root).lower() in ["test", "train"]:
+        split_dir = dataset_root
+    else:
+        split_dir = os.path.join(dataset_root, split)
+        if not os.path.exists(split_dir):
+            found = False
+            for sub in direct_subs:
+                if split.lower() in sub.lower():
+                    split_dir = os.path.join(dataset_root, sub)
+                    found = True
+                    break
+            if not found:
+                split_dir = dataset_root
+
+    if not os.path.exists(split_dir):
+        print(f"[!] Thư mục split không tồn tại: {split_dir}")
+        return []
+
     seq_dirs = sorted([
         os.path.join(split_dir, d) for d in os.listdir(split_dir)
         if os.path.isdir(os.path.join(split_dir, d)) and ('Test' in d or 'Train' in d or 'UAV' in d)
     ])
+
+    if not seq_dirs:
+        seq_dirs = sorted([
+            os.path.join(split_dir, d) for d in os.listdir(split_dir)
+            if os.path.isdir(os.path.join(split_dir, d)) and not d.startswith('.')
+        ])
+
     seqs = []
     for sd in seq_dirs:
         sname = os.path.basename(sd)
+
+        # 1. Tìm file video (.mp4, .avi)
         vfiles = glob.glob(os.path.join(sd, '*.mp4')) or glob.glob(os.path.join(sd, '*.avi'))
+
+        # 2. Tìm frame ảnh (.jpg, .png) nếu không có video
+        all_imgs = sorted(glob.glob(os.path.join(sd, '*.jpg')) + glob.glob(os.path.join(sd, '*.png')) + glob.glob(os.path.join(sd, '*.JPEG')))
+        img_files = []
+        if len(all_imgs) > 1:
+            digit_imgs = [f for f in all_imgs if os.path.splitext(os.path.basename(f))[0].isdigit()]
+            if digit_imgs:
+                img_files = digit_imgs
+            else:
+                img_files = [f for f in all_imgs if sname not in os.path.basename(f)]
+                if not img_files:
+                    img_files = all_imgs
+
+        # 3. Tìm file ground truth
         gt_file = os.path.join(sd, 'groundtruth_rect.txt')
+        if not os.path.exists(gt_file):
+            gt_file = os.path.join(sd, 'groundtruth.txt')
+        if not os.path.exists(gt_file):
+            gt_file = os.path.join(sd, f'{sname}.txt')
+        if not os.path.exists(gt_file):
+            txt_cands = [f for f in glob.glob(os.path.join(sd, '*.txt')) if 'absent' not in os.path.basename(f) and 'attr' not in os.path.basename(f) and 'lang' not in os.path.basename(f)]
+            if txt_cands:
+                gt_file = txt_cands[0]
+
         absent_file = os.path.join(sd, 'absent.txt')
-        if not vfiles or not os.path.exists(gt_file):
+
+        if (not vfiles and not img_files) or not os.path.exists(gt_file):
             continue
+
         gts = parse_groundtruth(gt_file)
         absents = parse_absent(absent_file)
         if not gts:
             continue
-        valid_len = len(gts)
-        seqs.append({
-            "name": sname,
-            "video_file": vfiles[0],
-            "gt_boxes": gts[:valid_len],
-            "absent_flags": absents[:valid_len] if absents else None,
-            "start_frame": 0,
-            "end_frame": valid_len
-        })
+
+        if img_files:
+            valid_len = min(len(img_files), len(gts))
+            seqs.append({
+                "name": sname,
+                "img_files": img_files[:valid_len],
+                "gt_boxes": gts[:valid_len],
+                "absent_flags": absents[:valid_len] if absents else None,
+                "start_frame": 0,
+                "end_frame": valid_len
+            })
+        else:
+            valid_len = len(gts)
+            seqs.append({
+                "name": sname,
+                "video_file": vfiles[0],
+                "gt_boxes": gts[:valid_len],
+                "absent_flags": absents[:valid_len] if absents else None,
+                "start_frame": 0,
+                "end_frame": valid_len
+            })
+
     if max_seqs and max_seqs > 0:
         seqs = seqs[:max_seqs]
     return seqs
