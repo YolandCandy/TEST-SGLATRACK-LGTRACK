@@ -17,7 +17,10 @@ import argparse
 import shutil
 import numpy as np
 import cv2
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 from tqdm import tqdm
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -234,12 +237,91 @@ def load_uav123_sequences(dataset_root, max_seqs=None):
     if not os.path.exists(seq_dir):
         seq_dir = os.path.join(dataset_root, 'data_seq')
 
-    anno_files = sorted(glob.glob(os.path.join(anno_dir, '*.txt')))
+    # Load official sequence metadata (from configSeqs.m)
+    try:
+        from uav123_config import UAV123_CONFIGS
+    except ImportError:
+        cfg_file = os.path.join(ROOT_DIR, 'uav123_config.json')
+        if os.path.exists(cfg_file):
+            import json
+            with open(cfg_file) as f:
+                UAV123_CONFIGS = json.load(f)
+        else:
+            UAV123_CONFIGS = []
+
     seqs = []
+    loaded_names = set()
+
+    # 1. Load sequences using official configSeqs.m specifications (handles split sub-sequences)
+    for cfg in UAV123_CONFIGS:
+        seq_name = cfg['name']
+        folder = cfg['folder']
+        start_frame = cfg['startFrame']
+        end_frame = cfg['endFrame']
+        nz = cfg['nz']
+        ext = cfg['ext']
+
+        # Find sequence image directory
+        cand_dir = os.path.join(seq_dir, folder)
+        if not os.path.exists(cand_dir):
+            cand_dir = os.path.join(dataset_root, 'data_seq', folder)
+        if not os.path.exists(cand_dir):
+            cand_dir = os.path.join(dataset_root, folder)
+        if not os.path.exists(cand_dir):
+            continue
+
+        # Find annotation file
+        anno_file = os.path.join(anno_dir, f"{seq_name}.txt")
+        if not os.path.exists(anno_file):
+            anno_file = os.path.join(dataset_root, 'anno', f"{seq_name}.txt")
+        if not os.path.exists(anno_file):
+            continue
+
+        gts = parse_groundtruth(anno_file)
+        if not gts:
+            continue
+
+        # Generate exact frame paths from startFrame to endFrame
+        img_files = [
+            os.path.join(cand_dir, f"{fn:0{nz}}.{ext}")
+            for fn in range(start_frame, end_frame + 1)
+        ]
+
+        # Verification and fallback if filename casing differs
+        if not img_files or not os.path.exists(img_files[0]):
+            img_files_upper = [
+                os.path.join(cand_dir, f"{fn:0{nz}}.{ext.upper()}")
+                for fn in range(start_frame, end_frame + 1)
+            ]
+            if img_files_upper and os.path.exists(img_files_upper[0]):
+                img_files = img_files_upper
+            else:
+                all_imgs = sorted(glob.glob(os.path.join(cand_dir, f"*.{ext}")) or
+                                 glob.glob(os.path.join(cand_dir, "*.*")))
+                if all_imgs:
+                    s_idx = max(0, start_frame - 1)
+                    e_idx = min(len(all_imgs), end_frame)
+                    img_files = all_imgs[s_idx:e_idx]
+                else:
+                    continue
+
+        valid_len = min(len(img_files), len(gts))
+        seqs.append({
+            "name": seq_name,
+            "img_files": img_files[:valid_len],
+            "gt_boxes": gts[:valid_len],
+            "start_frame": 0,
+            "end_frame": valid_len
+        })
+        loaded_names.add(seq_name)
+
+    # 2. Fallback for any sequence txt in anno directory not present in UAV123_CONFIGS
+    anno_files = sorted(glob.glob(os.path.join(anno_dir, '*.txt')))
     for af in anno_files:
         seq_name = os.path.splitext(os.path.basename(af))[0]
+        if seq_name in loaded_names:
+            continue
         video_name = seq_name.split('_')[0]
-        # Match sequence directory
         cand_dir = os.path.join(seq_dir, video_name)
         if not os.path.exists(cand_dir):
             cand_dir = os.path.join(seq_dir, seq_name)
@@ -251,13 +333,16 @@ def load_uav123_sequences(dataset_root, max_seqs=None):
         gts = parse_groundtruth(af)
         if not gts:
             continue
+        valid_len = min(len(imgs), len(gts))
         seqs.append({
             "name": seq_name,
-            "img_files": imgs,
-            "gt_boxes": gts,
+            "img_files": imgs[:valid_len],
+            "gt_boxes": gts[:valid_len],
             "start_frame": 0,
-            "end_frame": min(len(imgs), len(gts))
+            "end_frame": valid_len
         })
+        loaded_names.add(seq_name)
+
     if max_seqs and max_seqs > 0:
         seqs = seqs[:max_seqs]
     return seqs
@@ -266,7 +351,10 @@ def load_antiuav_sequences(dataset_root, split="Test", max_seqs=None):
     split_dir = os.path.join(dataset_root, split)
     if not os.path.exists(split_dir):
         split_dir = dataset_root
-    seq_dirs = sorted([os.path.join(split_dir, d) for d in os.listdir(split_dir) if os.path.isdir(os.path.join(split_dir, d)) and 'Test' in d or 'Train' in d])
+    seq_dirs = sorted([
+        os.path.join(split_dir, d) for d in os.listdir(split_dir)
+        if os.path.isdir(os.path.join(split_dir, d)) and ('Test' in d or 'Train' in d or 'UAV' in d)
+    ])
     seqs = []
     for sd in seq_dirs:
         sname = os.path.basename(sd)
@@ -279,13 +367,14 @@ def load_antiuav_sequences(dataset_root, split="Test", max_seqs=None):
         absents = parse_absent(absent_file)
         if not gts:
             continue
+        valid_len = len(gts)
         seqs.append({
             "name": sname,
             "video_file": vfiles[0],
-            "gt_boxes": gts,
-            "absent_flags": absents,
+            "gt_boxes": gts[:valid_len],
+            "absent_flags": absents[:valid_len] if absents else None,
             "start_frame": 0,
-            "end_frame": len(gts)
+            "end_frame": valid_len
         })
     if max_seqs and max_seqs > 0:
         seqs = seqs[:max_seqs]
@@ -301,10 +390,13 @@ def main():
     args = parser.parse_args()
 
     # Tối ưu hóa PyTorch trên GPU
-    torch.backends.cudnn.enabled = False
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch is not None:
+        torch.backends.cudnn.enabled = False
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = "cpu"
     print(f"[*] Thiết bị suy luận: {device}")
-    if device == "cuda":
+    if torch is not None and device == "cuda":
         print(f"[*] Tên GPU: {torch.cuda.get_device_name(0)}")
 
     # Xác định đường dẫn datasets

@@ -31,6 +31,10 @@ echo ""
 echo "[2/4] Kiểm tra checkpoints trọng số..."
 bash checkpoints/download_weights.sh
 
+# Cấu hình Torch Hub cache để sử dụng ngay weights local, không tải lại từ Facebook Research
+mkdir -p "$HOME/.cache/torch/hub/checkpoints"
+cp -n "$DIR/checkpoints/"*.pth "$HOME/.cache/torch/hub/checkpoints/" 2>/dev/null || true
+
 # 4. Kiểm tra và chuẩn bị dữ liệu
 echo ""
 echo "[3/4] Tìm kiếm và chuẩn bị tập dữ liệu..."
