@@ -47,13 +47,33 @@ DATA_DIR=""
 
 # 4.1 Ưu tiên 1: Tìm xem dataset đã được add và giải nén sẵn trong /kaggle/input hay chưa
 if [ -d "/kaggle/input" ]; then
-    for d in /kaggle/input/* /kaggle/input/*/*; do
-        if [ -d "$d/Test" ] || [ -d "$d/Train" ] || [ -d "$d/UAV-Anti-UAV/Test" ]  || [ -d "$d/UAVAntiUAV-Test/Test" ]; then
-            DATA_DIR="$d"
-            echo "[+] Tìm thấy dataset đã giải nén sẵn tại: $DATA_DIR"
+    # Kiểm tra trực tiếp các đường dẫn cụ thể
+    KNOWN_PATHS=(
+        "/kaggle/input/datasets/huynhat15/uavantiuav-test"
+        "/kaggle/input/uavantiuav-test"
+        "/kaggle/input/uav-anti-uav"
+        "/kaggle/input/anti-uav"
+    )
+    for kp in "${KNOWN_PATHS[@]}"; do
+        if [ -d "$kp/Test" ] || [ -d "$kp/Train" ]; then
+            DATA_DIR="$kp"
+            echo "[+] Tìm thấy dataset tại: $DATA_DIR"
             break
         fi
     done
+
+    # Nếu chưa thấy, tìm kiếm đệ quy mọi thư mục "Test" trong /kaggle/input (tối đa 5 tầng)
+    if [ -z "$DATA_DIR" ]; then
+        for test_d in $(find /kaggle/input -maxdepth 5 -type d -name "Test" 2>/dev/null); do
+            p_dir=$(dirname "$test_d")
+            # Kiểm tra xem thư mục Test có chứa chuỗi video không
+            if [ -n "$(ls -A "$test_d" 2>/dev/null)" ]; then
+                DATA_DIR="$p_dir"
+                echo "[+] Tìm thấy dataset đã giải nén sẵn tại: $DATA_DIR"
+                break
+            fi
+        done
+    fi
 
     # 4.2 Ưu tiên 2: Nếu chỉ có file .zip trong /kaggle/input, giải nén sang /tmp/datasets
     if [ -z "$DATA_DIR" ]; then

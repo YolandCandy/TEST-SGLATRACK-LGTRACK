@@ -214,12 +214,14 @@ def find_datasets(base_path):
         '/content/drive/MyDrive/datasets',
         '/content/drive/MyDrive'
     ]
-    # Tự động duyệt tất cả các thư mục con trong /kaggle/input
+    # Tự động duyệt đệ quy các thư mục trong /kaggle/input (tối đa 5 tầng)
     if os.path.exists('/kaggle/input'):
-        for sub in os.listdir('/kaggle/input'):
-            sub_p = os.path.join('/kaggle/input', sub)
-            if os.path.isdir(sub_p) and sub_p not in search_dirs:
-                search_dirs.append(sub_p)
+        for root, dirs, _ in os.walk('/kaggle/input'):
+            if 'Test' in dirs or 'Train' in dirs or 'data_seq' in dirs or 'UAV123' in dirs or 'UAV-Anti-UAV' in dirs:
+                if root not in search_dirs:
+                    search_dirs.append(root)
+            if root.count(os.sep) - '/kaggle/input'.count(os.sep) >= 4:
+                del dirs[:]
 
     for d in search_dirs:
         if not d or not os.path.exists(d):
