@@ -25,22 +25,79 @@ from lib.models.lgtrack.vision_transformer import VisionTransformer, trunc_norma
 __all__ = ['VisionTransformerDistilled']  # model_registry will add each entrypoint fn to this
 
 enabled_layer_num = 1
-start_layer = 5     ## ture start = start_layer + 1
+start_layer = 8     ## ture start = start_layer + 1
 
-class ThreeLayerMLP(nn.Module):
-    def __init__(self, input_dim=320, output_dim=6, hidden_dim=160):
-        super(ThreeLayerMLP, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)  
-        self.fc2 = nn.Linear(hidden_dim, output_dim)  
-        self.relu = nn.ReLU()  
-        self.sigmoid = nn.Sigmoid()  
-    
+class SelectionModule(nn.Module):
+    """
+    Selection Module (3-layer MLP) for Similarity Guided Layer Adaptation (SGLA).
+    Proposed in LGTrack architecture to dynamically select downstream transformer layers.
+    """
+    def __init__(self, input_dim=320, output_dim=3, hidden_dim=160):
+        super(SelectionModule, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
+
+        # Standard 3-layer MLP matching LGTrack architecture diagram
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
+        self.sigmoid = nn.Sigmoid()
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize fc2 as identity-like for seamless pass-through
+        nn.init.eye_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+        nn.init.trunc_normal_(self.fc1.weight, std=0.02)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.trunc_normal_(self.fc3.weight, std=0.02)
+        nn.init.zeros_(self.fc3.bias)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """
+        Support backward compatibility with legacy 2-layer MLP checkpoints:
+        If checkpoint contains 'fc2.weight' matching output_dim,
+        route it to fc3, and set fc2 to identity.
+        """
+        fc2_w_key = prefix + 'fc2.weight'
+        fc2_b_key = prefix + 'fc2.bias'
+        fc3_w_key = prefix + 'fc3.weight'
+        fc3_b_key = prefix + 'fc3.bias'
+
+        if fc2_w_key in state_dict and fc3_w_key not in state_dict:
+            fc2_weight = state_dict[fc2_w_key]
+            if fc2_weight.shape == self.fc3.weight.shape:
+                state_dict[fc3_w_key] = state_dict.pop(fc2_w_key)
+                if fc2_b_key in state_dict:
+                    state_dict[fc3_b_key] = state_dict.pop(fc2_b_key)
+                state_dict[fc2_w_key] = torch.eye(self.fc2.out_features, self.fc2.in_features)
+                state_dict[fc2_b_key] = torch.zeros(self.fc2.out_features)
+
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
+
     def forward(self, x):
-        x = self.fc1(x)  
-        x = self.relu(x)  
-        x = self.fc2(x)  
-        pro = self.sigmoid(x)  
+        # Standardize 1-D features: support [B, L, C] tokens or [B, L] vector
+        if x.dim() == 3:
+            if x.shape[1] == self.input_dim:
+                x = x[:, :, 0]
+            else:
+                x = x.mean(dim=-1)
+        x = self.fc1(x)
+        x = self.relu1(x)
+        x = self.fc2(x)
+        x = self.relu2(x)
+        x = self.fc3(x)
+        pro = self.sigmoid(x)
         return pro
+
+
+ThreeLayerMLP = SelectionModule  # Alias for backward compatibility
 
 
 class VisionTransformerDistilled(VisionTransformer):
@@ -64,7 +121,7 @@ class VisionTransformerDistilled(VisionTransformer):
 
         self.init_weights(weight_init)
         
-        self.MLP = self.MLP = ThreeLayerMLP(input_dim=320, output_dim=12-1-start_layer)
+        self.MLP = SelectionModule(input_dim=320, output_dim=12-1-start_layer)
 
     def init_weights(self, mode=''):
         trunc_normal_(self.dist_token, std=.02)

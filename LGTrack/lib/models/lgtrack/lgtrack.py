@@ -17,58 +17,67 @@ from scipy.stats import multivariate_normal
 import cv2
 
 class GGCA(nn.Module):  
-    def __init__(self, channel, h, w, reduction=16, num_groups=4):
+    """
+    Global Grouped Coordinate Attention (GGCA)
+    Proposed in LGTrack architecture for feature refinement before Prediction Head.
+    """
+    def __init__(self, channel=192, h=16, w=16, reduction=16, num_groups=4):
         super(GGCA, self).__init__()
         self.num_groups = num_groups  
         self.group_channels = channel // num_groups  
         self.h = h  
         self.w = w  
    
-        self.avg_pool_h = nn.AdaptiveAvgPool2d((h, 1))  # (h, 1)
-        self.max_pool_h = nn.AdaptiveMaxPool2d((h, 1))
+        self.avg_pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.max_pool_h = nn.AdaptiveMaxPool2d((None, 1))
     
-        self.avg_pool_w = nn.AdaptiveAvgPool2d((1, w))  # (1, w)
-        self.max_pool_w = nn.AdaptiveMaxPool2d((1, w))
+        self.avg_pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.max_pool_w = nn.AdaptiveMaxPool2d((1, None))
         
+        mid_channels = max(self.group_channels // reduction, 8)
         self.shared_conv = nn.Sequential(
-            nn.Conv2d(in_channels=self.group_channels, out_channels=self.group_channels // reduction,
+            nn.Conv2d(in_channels=self.group_channels, out_channels=mid_channels,
                       kernel_size=(1, 1)),
-            nn.BatchNorm2d(self.group_channels // reduction),
+            nn.BatchNorm2d(mid_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=self.group_channels // reduction, out_channels=self.group_channels,
+            nn.Conv2d(in_channels=mid_channels, out_channels=self.group_channels,
                       kernel_size=(1, 1))
         )
         
         self.sigmoid_h = nn.Sigmoid()
         self.sigmoid_w = nn.Sigmoid()
+        self._init_weights()
+
+    def _init_weights(self):
+        # Initialize last conv so attention starts smoothly close to 1.0 (identity-friendly)
+        last_conv = self.shared_conv[3]
+        nn.init.constant_(last_conv.weight, 0.0)
+        nn.init.constant_(last_conv.bias, 2.0)
 
     def forward(self, x):
         batch_size, channel, height, width = x.size()
         
-        assert channel % self.num_groups == 0, "The number of channels must be divisible by the number of groups."
+        assert channel % self.num_groups == 0, f"Channel ({channel}) must be divisible by num_groups ({self.num_groups})."
 
-        x = x.view(batch_size, self.num_groups, self.group_channels, height, width)
+        # Group channels: (B * num_groups, group_channels, H, W)
+        x_grouped = x.view(batch_size * self.num_groups, self.group_channels, height, width)
         
-        x_h_avg = self.avg_pool_h(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
-            batch_size, self.num_groups, self.group_channels, self.h, 1)
-        x_h_max = self.max_pool_h(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
-            batch_size, self.num_groups, self.group_channels, self.h, 1)
+        # Height-wise Coordinate Attention
+        x_h_avg = self.avg_pool_h(x_grouped)
+        x_h_max = self.max_pool_h(x_grouped)
+        y_h_avg = self.shared_conv(x_h_avg)
+        y_h_max = self.shared_conv(x_h_max)
+        att_h = self.sigmoid_h(y_h_avg + y_h_max)
 
-        x_w_avg = self.avg_pool_w(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
-            batch_size, self.num_groups, self.group_channels, 1, self.w)
-        x_w_max = self.max_pool_w(x.view(batch_size * self.num_groups, self.group_channels, height, width)).view(
-            batch_size, self.num_groups, self.group_channels, 1, self.w)
+        # Width-wise Coordinate Attention
+        x_w_avg = self.avg_pool_w(x_grouped)
+        x_w_max = self.max_pool_w(x_grouped)
+        y_w_avg = self.shared_conv(x_w_avg)
+        y_w_max = self.shared_conv(x_w_max)
+        att_w = self.sigmoid_w(y_w_avg + y_w_max)
 
-        y_h_avg = self.shared_conv(x_h_avg.view(batch_size * self.num_groups, self.group_channels, self.h, 1))
-        y_h_max = self.shared_conv(x_h_max.view(batch_size * self.num_groups, self.group_channels, self.h, 1))
-
-        y_w_avg = self.shared_conv(x_w_avg.view(batch_size * self.num_groups, self.group_channels, 1, self.w))
-        y_w_max = self.shared_conv(x_w_max.view(batch_size * self.num_groups, self.group_channels, 1, self.w))
-
-        att_h = self.sigmoid_h(y_h_avg + y_h_max).view(batch_size, self.num_groups, self.group_channels, self.h, 1)
-        att_w = self.sigmoid_w(y_w_avg + y_w_max).view(batch_size, self.num_groups, self.group_channels, 1, self.w)
-
-        out = x * att_h * att_w
+        # Feature Refinement via cross-dimension interaction
+        out = x_grouped * att_h * att_w
         out = out.view(batch_size, channel, height, width)
 
         return out
@@ -100,7 +109,10 @@ class LGTrack(nn.Module):
 
         self.intensity = []
         self.randomMask = False
-        self.GGCAblock = GGCA(channel=192, h=16, w=16, reduction=16, num_groups=4)
+        channel = getattr(transformer, 'embed_dim', 192)
+        h = getattr(self, 'feat_sz_s', 16)
+        w = getattr(self, 'feat_sz_s', 16)
+        self.GGCAblock = GGCA(channel=channel, h=h, w=w, reduction=16, num_groups=4)
 
     def random_masking(self, N, H, W, D, mask_ratio, device):
         """
@@ -137,7 +149,7 @@ class LGTrack(nn.Module):
         y_points = (np.floor(np.random.uniform(0, intensity.shape[0], num_points))).astype(np.int32)
 
         # Accept or reject points based on the rate function
-        accept_prob = intensity[x_points,y_points] / intensity.max()
+        accept_prob = intensity[y_points, x_points] / intensity.max()
         accepted_points = np.random.rand(num_points) < accept_prob
 
         x_points = x_points[accepted_points]
@@ -196,25 +208,24 @@ class LGTrack(nn.Module):
                 is_distill=False,
                 ):
 
-
-        if len(self.intensity) == 0:
-            template_r = int(template.shape[-1]/2)
-            sigma = 64
-            x, y = np.mgrid[-template_r:template_r:1, -template_r:template_r:1]
-            pos = np.dstack((x, y))
-            intensity = multivariate_normal([0.0, 0.], [[sigma*template_r, 0.0], [0.0, sigma*template_r]]).pdf(pos)
-            intensity = intensity/intensity.sum()
-        else:
-            intensity = self.intensity
-        mask = self.masking_CoxProcess(template.shape[0], intensity, 16, 0.3, template.device)
-        mask = mask.repeat(1,template.shape[1],1,1)
-
-        x, aux_dict = self.backbone(z=template, x=search)
-
         if self.training and not is_distill:
+            if len(self.intensity) == 0:
+                template_r = int(template.shape[-1]/2)
+                sigma = 64
+                x, y = np.mgrid[-template_r:template_r:1, -template_r:template_r:1]
+                pos = np.dstack((x, y))
+                intensity = multivariate_normal([0.0, 0.], [[sigma*template_r, 0.0], [0.0, sigma*template_r]]).pdf(pos)
+                intensity = intensity/intensity.sum()
+            else:
+                intensity = self.intensity
+            mask = self.masking_CoxProcess(template.shape[0], intensity, 16, 0.3, template.device)
+            mask = mask.repeat(1, template.shape[1], 1, 1)
+
+            x, aux_dict = self.backbone(z=template, x=search)
             x1, aux_dict1 = self.backbone(z=template * mask, x=search)
-            sim_loss = torch.nn.functional.mse_loss(x[:, :self.feat_len_t],x1[:, :self.feat_len_t].detach())
+            sim_loss = torch.nn.functional.mse_loss(x1[:, :self.feat_len_t], x[:, :self.feat_len_t].detach())
         else:
+            x, aux_dict = self.backbone(z=template, x=search)
             sim_loss = 0
 
         # Forward head
@@ -250,16 +261,10 @@ class LGTrack(nn.Module):
         cat_feature: output embeddings of the backbone, it can be (HW1+HW2, B, C) or (HW2, B, C)
         """
         enc_opt = cat_feature[:, -self.feat_len_s:]  # encoder output for the search region (B, HW, C)
-        # print("enc_opt shape:", enc_opt.shape)  # 打印 [B, HW, C]
         opt = (enc_opt.unsqueeze(-1)).permute((0, 3, 2, 1)).contiguous()
         bs, Nq, C, HW = opt.size()
-        # print(bs, Nq, C, HW)
-        # print("HW:", HW)  # 实际特征数量
-        # print("self.feat_sz_s:", self.feat_sz_s)  # 预期特征图尺寸
-        # print("预期 HW:", self.feat_sz_s * self.feat_sz_s)  # 预期特征数量
-        opt_feat = opt.view(-1, C, self.feat_sz_s, self.feat_sz_s)
-        # opt_feat_input = opt.view(-1, C, self.feat_sz_s, self.feat_sz_s)
-        # opt_feat = self.GGCAblock(opt_feat_input)
+        opt_feat_input = opt.view(-1, C, self.feat_sz_s, self.feat_sz_s)
+        opt_feat = self.GGCAblock(opt_feat_input)
 
         if self.head_type == "CORNER":
             # run the corner head

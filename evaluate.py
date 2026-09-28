@@ -202,6 +202,8 @@ def find_datasets(base_path):
     }
     search_dirs = [
         base_path,
+        '/kaggle/input/datasets/yolandcandy/uav-anti-uav/Test-002/Test',
+        '/kaggle/input/datasets/yolandcandy/uav-anti-uav/Test-002',
         os.path.join(ROOT_DIR, 'data'),
         '/kaggle/input',
         '/kaggle/working',
@@ -471,7 +473,7 @@ def main():
     parser.add_argument('--dataset', type=str, default='all', choices=['all', 'uav123', 'anti_uav'], help='Dataset cần đánh giá')
     parser.add_argument('--data_dir', type=str, default='', help='Thư mục gốc chứa datasets')
     parser.add_argument('--max_seqs', type=int, default=0, help='Giới hạn số sequence (0 = toàn bộ)')
-    parser.add_argument('--models', type=str, default='all', choices=['all', 'sglatrack', 'lgtrack'], help='Mô hình đánh giá')
+    parser.add_argument('--models', type=str, default='lgtrack', choices=['all', 'sglatrack', 'lgtrack'], help='Mô hình đánh giá (mặc định: lgtrack)')
     parser.add_argument('--output_dir', type=str, default=os.path.join(ROOT_DIR, 'results'), help='Thư mục lưu kết quả')
     args = parser.parse_args()
 

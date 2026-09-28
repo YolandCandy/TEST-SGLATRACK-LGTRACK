@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# SCRIPT 1 BƯỚC DUY NHẤT CHẠY BENCHMARK TRÊN KAGGLE CHO TẬP UAV-ANTI-UAV
+# SCRIPT 1 BƯỚC DUY NHẤT CHẠY INFER LGTRACK TRÊN KAGGLE CHO TẬP UAV-ANTI-UAV
 # Sử dụng trên Kaggle Notebook:
-#   !bash run_kaggle.sh [--models all|sglatrack|lgtrack] [--max_seqs N]
+#   !bash run_kaggle.sh [--max_seqs N]
 # ==============================================================================
 
 set -e
@@ -43,19 +43,25 @@ cp -n "$DIR/checkpoints/"*.pth "$HOME/.cache/torch/hub/checkpoints/" 2>/dev/null
 echo ""
 echo "[3/4] Tìm kiếm tập dữ liệu UAV-Anti-UAV..."
 
-DATA_DIR=""
+TARGET_DATA_DIR="/kaggle/input/datasets/yolandcandy/uav-anti-uav/Test-002/Test"
+DATA_DIR="$TARGET_DATA_DIR"
 
-# 4.1 Ưu tiên 1: Tìm xem dataset đã được add và giải nén sẵn trong /kaggle/input hay chưa
-if [ -d "/kaggle/input" ]; then
-    # Kiểm tra trực tiếp các đường dẫn cụ thể
+# 4.1 Ưu tiên 1: Kiểm tra trực tiếp đường dẫn chỉ định
+if [ -d "$TARGET_DATA_DIR" ]; then
+    echo "[+] Tìm thấy dataset tại: $DATA_DIR"
+elif [ -d "/kaggle/input" ]; then
+    # Kiểm tra trực tiếp các đường dẫn liên quan
     KNOWN_PATHS=(
+        "$TARGET_DATA_DIR"
+        "/kaggle/input/datasets/yolandcandy/uav-anti-uav/Test-002"
+        "/kaggle/input/datasets/yolandcandy/uav-anti-uav"
         "/kaggle/input/datasets/huynhat15/uavantiuav-test"
         "/kaggle/input/uavantiuav-test"
         "/kaggle/input/uav-anti-uav"
         "/kaggle/input/anti-uav"
     )
     for kp in "${KNOWN_PATHS[@]}"; do
-        if [ -d "$kp/Test" ] || [ -d "$kp/Train" ]; then
+        if [ -d "$kp/Test" ] || [ -d "$kp/Train" ] || [ -d "$kp" ]; then
             DATA_DIR="$kp"
             echo "[+] Tìm thấy dataset tại: $DATA_DIR"
             break
@@ -63,12 +69,12 @@ if [ -d "/kaggle/input" ]; then
     done
 
     # Nếu chưa thấy, tìm kiếm đệ quy mọi thư mục "Test" trong /kaggle/input (tối đa 5 tầng)
-    if [ -z "$DATA_DIR" ]; then
+    if [ ! -d "$DATA_DIR" ]; then
         for test_d in $(find /kaggle/input -maxdepth 5 -type d -name "Test" 2>/dev/null); do
             p_dir=$(dirname "$test_d")
             # Kiểm tra xem thư mục Test có chứa chuỗi video không
             if [ -n "$(ls -A "$test_d" 2>/dev/null)" ]; then
-                DATA_DIR="$p_dir"
+                DATA_DIR="$test_d"
                 echo "[+] Tìm thấy dataset đã giải nén sẵn tại: $DATA_DIR"
                 break
             fi
@@ -76,7 +82,7 @@ if [ -d "/kaggle/input" ]; then
     fi
 
     # 4.2 Ưu tiên 2: Nếu chỉ có file .zip trong /kaggle/input, giải nén sang /tmp/datasets
-    if [ -z "$DATA_DIR" ]; then
+    if [ ! -d "$DATA_DIR" ]; then
         ANTI_ZIP=""
         for f in $(find /kaggle/input -name "*Anti-UAV*.zip" -o -name "*anti_uav*.zip" -o -name "*Test*.zip" 2>/dev/null); do
             if [ -f "$f" ]; then
@@ -95,8 +101,8 @@ if [ -d "/kaggle/input" ]; then
     fi
 fi
 
-# 4.3 Ưu tiên 3: Tìm kiếm tại các đường dẫn thông thường khác
-if [ -z "$DATA_DIR" ]; then
+# 4.3 Ưu tiên 3: Tìm kiếm tại các đường dẫn thông thường khác nếu chưa thấy
+if [ ! -d "$DATA_DIR" ]; then
     FALLBACK_DIRS=(
         "/kaggle/working/datasets"
         "/tmp/datasets"
@@ -113,10 +119,9 @@ if [ -z "$DATA_DIR" ]; then
     done
 fi
 
-if [ -z "$DATA_DIR" ]; then
-    echo "[!] Cảnh báo: Không tự động tìm thấy thư mục UAV-Anti-UAV."
-    echo "[*] Gợi ý: Hãy bấm 'Add Data' trên Kaggle và thêm dataset UAV-Anti-UAV."
-    echo "[*] Hoặc truyền trực tiếp đường dẫn bằng cờ --data_dir /path/to/dataset."
+if [ ! -d "$DATA_DIR" ]; then
+    echo "[!] Chú ý: Chưa tìm thấy thư mục cục bộ, sử dụng đường dẫn Kaggle chỉ định: $TARGET_DATA_DIR"
+    DATA_DIR="$TARGET_DATA_DIR"
 fi
 
 # Thiết lập thư mục lưu kết quả phù hợp với môi trường Kaggle
@@ -126,22 +131,22 @@ if [ ! -d "/kaggle/working" ]; then
 fi
 mkdir -p "$OUTPUT_DIR"
 
-# 5. Chạy benchmark đánh giá CHUYÊN BIỆT cho UAV-Anti-UAV
+# 5. Chạy benchmark đánh giá CHUYÊN BIỆT cho mô hình LGTrack trên UAV-Anti-UAV
 echo ""
-echo "[4/4] Bắt đầu chạy benchmark đánh giá tập UAV-Anti-UAV..."
-python3 evaluate.py --dataset anti_uav --data_dir "$DATA_DIR" --output_dir "$OUTPUT_DIR" "$@"
+echo "[4/4] Bắt đầu chạy benchmark đánh giá tập UAV-Anti-UAV với mô hình LGTrack..."
+python3 evaluate.py --dataset anti_uav --models lgtrack --data_dir "$DATA_DIR" --output_dir "$OUTPUT_DIR" "$@"
 
 echo ""
 echo "=================================================================="
-echo "          HOÀN THÀNH ĐÁNH GIÁ TẬP DỮ LIỆU UAV-ANTI-UAV!"
+echo "      HOÀN THÀNH ĐÁNH GIÁ MÔ HÌNH LGTRACK TRÊN UAV-ANTI-UAV!"
 echo " Báo cáo kết quả được lưu tại: $OUTPUT_DIR"
 echo "=================================================================="
 
 # Nén tự động thư mục results để người dùng tải về 1-click trên Kaggle Output
 if [ -d "$OUTPUT_DIR" ] && [ -d "/kaggle/working" ]; then
     cd /kaggle/working
-    zip -q -r benchmark_anti_uav_results.zip results/ 2>/dev/null || true
-    if [ -f "/kaggle/working/benchmark_anti_uav_results.zip" ]; then
-        echo "[+] Đã đóng gói sẵn file tải về: /kaggle/working/benchmark_anti_uav_results.zip"
+    zip -q -r benchmark_lgtrack_anti_uav_results.zip results/ 2>/dev/null || true
+    if [ -f "/kaggle/working/benchmark_lgtrack_anti_uav_results.zip" ]; then
+        echo "[+] Đã đóng gói sẵn file tải về: /kaggle/working/benchmark_lgtrack_anti_uav_results.zip"
     fi
 fi
