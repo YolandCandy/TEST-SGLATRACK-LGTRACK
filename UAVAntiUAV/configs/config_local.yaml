@@ -1,0 +1,98 @@
+# ============================================================
+# UAVAntiUAV — Local GPU Config (Smoke Test)
+# Mục đích: Chạy nhanh 1 epoch để kiểm tra code không lỗi
+# ============================================================
+
+device:
+  platform: local             # jetson | local | server
+  gpu_jetson: false
+
+# --- Paths ---
+paths:
+  data_dir: ./processed
+  raw_data_dir: ../UAV-Anti-UAV
+  gasnet_weights: ../UAV/gasnet_project/test/gasnet.best.pth
+  checkpoint_dir: ./checkpoints
+  log_dir: ./logs
+
+# --- Data Pipeline ---
+data_pipeline:
+  uav_anti_uav_dir: ./data/UAV-Anti-UAV
+  anti_uav_rgbt_dir: ./data/Anti-UAV-RGBT
+  uav123_dir: ./data/UAV123
+  output_dir: ./processed
+  num_before_frames: 16
+  num_after_frames: 16
+  frame_stride: 4
+  bbox_padding: 0.2
+  crop_size: 256
+  num_workers: 4
+
+# --- Training (smoke test: 1 epoch mỗi stage) ---
+train:
+  backbone: dinov3_convnext
+  resume: ""
+  batch_size: 16
+  num_instances: 4
+  num_frames: 16
+  num_workers: 4
+  use_amp: true
+  pin_memory: true
+  val_freq: 1                 # Local test/smoke test thì chạy val mỗi epoch để dễ debug
+
+  stage1:
+    epochs: 1                 # chỉ 1 epoch để test
+    lr: 3.5e-4
+    weight_decay: 5e-4
+
+  stage2:
+    epochs: 1                 # chỉ 1 epoch để test
+    lr_backbone: 1.0e-5
+    lr_temporal: 1.0e-4
+    lr_head: 1.0e-4
+    weight_decay: 5e-4
+
+  loss:
+    lam1: 1.0
+    lam2: 0.5
+    lam3: 0.05
+    lr_center: 0.5
+    triplet_margin: 0.3
+    label_smooth: 0.1
+
+# --- Evaluation ---
+eval:
+  backbone: dinov3_convnext
+  model_path: checkpoints/best_model.pth
+  query_json: ./processed/query_test.json
+  gallery_json: ./processed/gallery_test.json
+  output_dir: ./eval_results
+  batch_size: 16
+  num_workers: 4
+  backbone_only: false
+  reid_threshold: 0.7
+
+# --- Inference ---
+infer:
+  backbone: dinov3_convnext
+  seq_dir: all
+  model_path: ./best_model_dino_convnext.pth
+  output_video: output_reid.mp4
+  out_dir: ./infer_output/infer_pipeline_3
+  stride: 2
+  # 🛠️ FIX (14/9): PHẢI khớp `train.num_frames` (đang = 16).
+  # Trước đây = 8 → Mamba + mean-pooling chạy 8 token trong khi train 16
+  # → phân phối temporal token lệch sẵn, rồi bnneck khuếch đại → fine score tụt.
+  # Đánh đổi: cửa sổ dài hơn thì khó thu đủ trong đoạn tái xuất ngắn
+  # (xem md/15thg9.md §5 — cần resample/pad lên đủ num_frames).
+  num_frames: 16
+  bbox_padding: 0.2
+  max_anchor_size: 5
+  max_recent_size: 15
+  soft_lock_threshold: 0.3
+  reid_threshold: 0.75
+  hijack_threshold: 0.40
+  hijack_check_count: 5
+  update_interval_sec: 2.0
+  # 🛠️ (14/9): in cosine TRƯỚC bnneck (raw) vs SAU bnneck (fused). Mặc định true trong code.
+  debug_sim: true

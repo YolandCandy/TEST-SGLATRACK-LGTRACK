@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data and Checkpoints (Large files that shouldn't be pushed)
+processed/
+*.zip
+checkpoints/
+logs/
+eval_results/
+*.pth
+*.pt
+*.onnx
+data/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+configs/config_colab.yaml
+infer_output/
+
+*.mp4
+*.whl
+**/*.whl

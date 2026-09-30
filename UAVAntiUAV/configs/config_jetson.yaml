@@ -1,0 +1,140 @@
+# ============================================================
+# UAVAntiUAV — Jetson AGX Orin Config
+# Mục đích: Train/eval thật trên thiết bị Jetson (unified memory)
+# ============================================================
+
+device:
+  platform: jetson            # jetson | local | server
+  gpu_jetson: true
+
+# --- Paths ---
+paths:
+  data_dir: ./processed
+  raw_data_dir: ../UAV-Anti-UAV
+  gasnet_weights: ../UAV/gasnet_project/test/gasnet.best.pth
+  checkpoint_dir: ./checkpoints
+  log_dir: ./logs
+
+# --- Data Pipeline ---
+data_pipeline:
+  num_before_frames: 16
+  num_after_frames: 16
+  bbox_padding: 0.2
+  crop_size: 256
+  num_workers: 2
+
+# --- Training ---
+train:
+  resume: ""
+  backbone: "dinov3_convnext"
+  batch_size: 8
+  num_instances: 2
+  num_frames: 16
+  num_workers: 2
+  use_amp: false              # Jetson unified memory -> AMP dễ gây NaN
+  pin_memory: true
+
+  stage1:
+    epochs: 30
+    lr: 3.5e-4
+    weight_decay: 5e-4
+
+  stage2:
+    epochs: 20
+    lr_backbone: 1.0e-5
+    lr_temporal: 1.0e-4
+    lr_head: 1.0e-4
+    weight_decay: 5e-4
+
+  loss:
+    lam1: 1.0                 # triplet weight
+    lam2: 0.5                 # temporal consistency weight (chưa dùng)
+    lam3: 0.05                # center loss weight
+    lr_center: 0.5
+    triplet_margin: 0.3
+    label_smooth: 0.1
+
+# --- Evaluation ---
+eval:
+  model_path: UAVAntiUAV/checkpoints/best_model_v2.pth
+  pairs_json: ./processed/pairs_test.json
+  output_dir: ./eval_results/gasnet_mamba_v2
+  batch_size: 4
+  num_workers: 2
+  backbone: "dinov3_convnext"
+  backbone_only: false
+  reid_threshold: 0.7
+
+# --- Inference ---
+infer:
+  seq_dir: ./data/UAV-Anti-UAV/Test/UAV-Anti-UAV_Test_000059
+  model_path: ./best_model_conv.pth
+  output_video: results_demo.mp4
+  out_dir: ./infer_output/UAV-Anti-UAV_Test_000059
+  backbone: "dinov3_convnext"
+  # === New OOP Pipeline Thresholds ===
+  stride: 2
+  # 🛠️ FIX (14/9): PHẢI khớp `train.num_frames` (đang = 16).
+  # Trước đây = 8 → Mamba + mean-pooling chạy 8 token trong khi train 16
+  # → phân phối temporal token lệch sẵn, rồi bnneck khuếch đại → fine score tụt.
+  # Đánh đổi: cửa sổ dài hơn thì khó thu đủ trong đoạn tái xuất ngắn
+  # (xem md/15thg9.md §5 — cần resample/pad lên đủ num_frames).
+  num_frames: 16
+  bbox_padding: 0.2
+  max_anchor_size: 5
+  max_recent_size: 15
+  soft_lock_threshold: 0.6
+  reid_threshold: 0.75
+  hijack_threshold: 0.40
+  hijack_check_count: 5
+  update_interval_sec: 2.0
+  # 🛠️ (14/9): in cosine TRƯỚC bnneck (raw) vs SAU bnneck (fused). Mặc định true trong code.
+  debug_sim: true
+
+# --- Inference Robustness Test ---
+infer_robustness:
+  seq_dir: ./data/UAV-Anti-UAV/Test/UAV-Anti-UAV_Test_000212
+  data_root: ./data/UAV-Anti-UAV/Test
+  model_path: ./best_model.pth
+  output_video: ./output_robustness.mp4
+  out_dir: ./infer_robustness_new/UAV-Anti-UAV_Test_000212_2
+  backbone: "dinov3_convnext"
+  # === New OOP Pipeline Thresholds ===
+  stride: 2
+  # 🛠️ FIX (14/9): khớp `train.num_frames: 16` (trước đây = 8).
+  # `evaluate_reid_robustness.py` đọc block này qua cfg.get('infer_robustness').
+  num_frames: 16
+  bbox_padding: 0.2
+  num_imposters: 5
+  max_anchor_size: 5
+  max_recent_size: 15
+  soft_lock_threshold: 0.50
+  reid_threshold: 0.75
+  hijack_threshold: 0.40
+  hijack_check_count: 5
+  update_interval_sec: 2.0
+
+# --- Real-world Inference ---
+infer_realworld:
+  video: ./phan_rang/phanrang_raptor.mp4
+  yolo_model: yolov8n.pt
+  detector_conf: 0.1
+  detector_imgsz: 1088
+  detector_classes: [4]
+  lost_threshold: 10
+  model_path: ./best_model.pth
+  output_video: output_phanrang.mp4
+  out_dir: ./infer_realworld/phanrang_raptor_2
+  query_img: ""
+  start_sec: 13.0
+  # === New Pipeline Thresholds ===
+  stride: 2                    # Cửa sổ trượt lấy đặc trưng cách quãng
+  num_frames: 16               # Số frame cần thu thập trước khi chạy Mamba
+  bbox_padding: 0.2            # Mở rộng bounding box
+  max_anchor_size: 10          # Số lượng ảnh tối đa trong Anchor Bank
+  max_recent_size: 30          # Số lượng ảnh tối đa trong Recent Bank
+  soft_lock_threshold: 0.50    # Ngưỡng Lọc Thô (Coarse ReID)
+  reid_threshold: 0.75         # Ngưỡng Lọc Tinh (Fine ReID)
+  hijack_threshold: 0.40       # Ngưỡng phát hiện bám nhầm
+  hijack_check_count: 5        # Số lần kiểm tra anti-hijack sau Hard Lock
+  update_interval_sec: 2.0     # Thời gian giữa các lần cập nhật Memory Bank (giây)

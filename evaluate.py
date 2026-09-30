@@ -23,6 +23,12 @@ except ImportError:
     torch = None
 from tqdm import tqdm
 
+try:
+    from reid_tracker_pipeline import ReIDModelManager, IntegratedTrackerOrchestrator
+    HAS_REID_PIPELINE = True
+except Exception as e:
+    HAS_REID_PIPELINE = False
+
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def compute_iou(box1, box2):
@@ -121,10 +127,11 @@ def parse_absent(absent_file):
                 absents.append(int(line))
     return absents
 
-def run_tracker_on_sequence(tracker, seq_info):
+def run_tracker_on_sequence(tracker, seq_info, reid_manager=None, reid_cfg=None):
     img_files = seq_info.get('img_files', [])
     video_file = seq_info.get('video_file', None)
     gt_boxes = seq_info['gt_boxes']
+    absent_flags = seq_info.get('absent_flags', None)
     start_frame = seq_info.get('start_frame', 0)
     end_frame = seq_info.get('end_frame', len(gt_boxes))
 
@@ -135,40 +142,73 @@ def run_tracker_on_sequence(tracker, seq_info):
             cap.read()
         ret, first_img = cap.read()
         if not ret:
-            return None, None
+            return None, None, {}
     elif img_files:
         first_img = cv2.imread(img_files[start_frame])
     else:
-        return None, None
-
-    init_box = [float(v) for v in gt_boxes[0]]
-    first_img_rgb = cv2.cvtColor(first_img, cv2.COLOR_BGR2RGB)
-    tracker.initialize(first_img_rgb, {'init_bbox': init_box})
+        return None, None, {}
 
     total_frames = end_frame - start_frame
-    pred_boxes = [init_box]
-    frame_times = [0.0]
+    pred_boxes = []
+    frame_times = []
+    reid_stats = {}
 
-    for idx in range(1, total_frames):
-        curr_frame_idx = start_frame + idx
-        if img_files:
-            frame = cv2.imread(img_files[curr_frame_idx])
-        else:
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                break
+    first_img_rgb = cv2.cvtColor(first_img, cv2.COLOR_BGR2RGB)
 
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        t0 = time.time()
-        out = tracker.track(frame_rgb)
-        t_el = time.time() - t0
-        box = [float(v) for v in out['target_bbox']]
-        pred_boxes.append(box)
-        frame_times.append(t_el)
+    if reid_manager is not None and HAS_REID_PIPELINE:
+        orchestrator = IntegratedTrackerOrchestrator(tracker, reid_manager, cfg=reid_cfg)
+        first_is_absent = (absent_flags[start_frame] == 1) if (absent_flags and start_frame < len(absent_flags)) else False
+        p_box, state, score = orchestrator.step(first_img_rgb, gt_boxes[start_frame], first_is_absent, start_frame)
+        pred_boxes.append(p_box)
+        frame_times.append(0.0)
+
+        for idx in range(1, total_frames):
+            curr_frame_idx = start_frame + idx
+            if img_files:
+                frame = cv2.imread(img_files[curr_frame_idx])
+            else:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    break
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            is_absent = (absent_flags[curr_frame_idx] == 1) if (absent_flags and curr_frame_idx < len(absent_flags)) else False
+            gt_box = gt_boxes[curr_frame_idx] if curr_frame_idx < len(gt_boxes) else [0, 0, 0, 0]
+
+            t0 = time.time()
+            p_box, state, score = orchestrator.step(frame_rgb, gt_box, is_absent, curr_frame_idx)
+            t_el = time.time() - t0
+
+            pred_boxes.append(p_box)
+            frame_times.append(t_el)
+
+        reid_stats = orchestrator.stats
+    else:
+        init_box = [float(v) for v in gt_boxes[0]]
+        tracker.initialize(first_img_rgb, {'init_bbox': init_box})
+        pred_boxes.append(init_box)
+        frame_times.append(0.0)
+
+        for idx in range(1, total_frames):
+            curr_frame_idx = start_frame + idx
+            if img_files:
+                frame = cv2.imread(img_files[curr_frame_idx])
+            else:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    break
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            t0 = time.time()
+            out = tracker.track(frame_rgb)
+            t_el = time.time() - t0
+            box = [float(v) for v in out['target_bbox']]
+            pred_boxes.append(box)
+            frame_times.append(t_el)
 
     if cap:
         cap.release()
-    return pred_boxes, frame_times
+    return pred_boxes, frame_times, reid_stats
 
 def evaluate_predictions(pred_boxes, gt_boxes, absent_flags=None):
     ious, cles = [], []
@@ -475,6 +515,14 @@ def main():
     parser.add_argument('--max_seqs', type=int, default=0, help='Giới hạn số sequence (0 = toàn bộ)')
     parser.add_argument('--models', type=str, default='lgtrack', choices=['all', 'sglatrack', 'lgtrack'], help='Mô hình đánh giá (mặc định: lgtrack)')
     parser.add_argument('--output_dir', type=str, default=os.path.join(ROOT_DIR, 'results'), help='Thư mục lưu kết quả')
+    
+    # Các tham số cho luồng Detection - Tracking - ReID (Chiến lược A)
+    parser.add_argument('--use_reid', action='store_true', help='Kích hoạt pipeline Detection-Tracking-ReID (Chiến lược A)')
+    parser.add_argument('--reid_weights', type=str, default='', help='Đường dẫn checkpoint ReID (mặc định tự động tìm)')
+    parser.add_argument('--reid_backbone', type=str, default='dinov3_convnext', choices=['dinov3_convnext', 'resnet50_ibn'], help='Backbone của UAVReIDNet')
+    parser.add_argument('--reid_threshold', type=float, default=0.75, help='Ngưỡng xác thực Hard Lock (ReID Fine score)')
+    parser.add_argument('--soft_lock_threshold', type=float, default=0.30, help='Ngưỡng Soft Lock (Coarse score)')
+    parser.add_argument('--reid_frames', type=int, default=12, help='Độ dài cửa sổ Mamba (mặc định: 12 frames)')
     args = parser.parse_args()
 
     # Tối ưu hóa PyTorch trên GPU
@@ -486,6 +534,26 @@ def main():
     print(f"[*] Thiết bị suy luận: {device}")
     if torch is not None and device == "cuda":
         print(f"[*] Tên GPU: {torch.cuda.get_device_name(0)}")
+
+    # Khởi tạo ReID Manager nếu bật --use_reid
+    reid_mgr = None
+    reid_cfg = None
+    if args.use_reid:
+        if not HAS_REID_PIPELINE:
+            print("[!] CẢNH BÁO: Không tìm thấy reid_tracker_pipeline. Chạy tracking thuần.")
+        else:
+            print("[*] KÍCH HOẠT LUỒNG DETECTION - TRACKING - REID (CHIẾN LƯỢC A)")
+            reid_cfg = {
+                'num_frames': args.reid_frames,
+                'soft_lock_threshold': args.soft_lock_threshold,
+                'reid_threshold': args.reid_threshold,
+                'stride': 2,
+                'bbox_padding': 0.2,
+                'update_interval_sec': 2.0
+            }
+            reid_mgr = ReIDModelManager(checkpoint_path=args.reid_weights,
+                                        backbone=args.reid_backbone,
+                                        device=torch.device(device) if torch else None)
 
     # Xác định đường dẫn datasets
     ds_paths = find_datasets(args.data_dir)
@@ -549,19 +617,19 @@ def main():
         summary[dname] = {}
 
         for mname, model_fn in models_to_run:
-            print(f"\n---> Khởi động mô hình: {mname} trên {dname}...")
+            effective_mname = f"{mname}+ReID" if (args.use_reid and reid_mgr is not None) else mname
+            print(f"\n---> Khởi động mô hình: {effective_mname} trên {dname}...")
             tracker = None  # Khởi tạo lười (lazy load) chỉ khi cần chạy GPU
             
             p_list, a_list, iou_list, fps_list = [], [], [], []
-            pbar = tqdm(seq_list, desc=f"[{mname}] {dname}")
+            pbar = tqdm(seq_list, desc=f"[{effective_mname}] {dname}")
 
             for sinfo in pbar:
                 sname = sinfo['name']
-                txt_out = os.path.join(args.output_dir, 'tracking_results', mname, dname, f"{sname}.txt")
+                txt_out = os.path.join(args.output_dir, 'tracking_results', effective_mname, dname, f"{sname}.txt")
                 expected_len = sinfo.get('end_frame', len(sinfo['gt_boxes'])) - sinfo.get('start_frame', 0)
 
                 # KIỂM TRA TỰ ĐỘNG KHÔI PHỤC (RESUME CAPABILITY):
-                # Nếu chuỗi này đã được chạy và lưu kết quả trước đó -> đọc kết quả cũ, bỏ qua chạy lại GPU
                 if os.path.exists(txt_out):
                     cached_boxes = parse_groundtruth(txt_out)
                     if len(cached_boxes) >= max(1, expected_len - 5):
@@ -575,18 +643,20 @@ def main():
                         fps_list.append(avg_fps)
                         pbar.set_postfix({"Resumed": sname, "Prec@20": f"{prec20:.1f}%", "AUC": f"{auc:.1f}%"})
                         
-                        if (dname, sname, mname) not in existing_keys:
-                            row = [dname, sname, mname, valid_n, round(prec20, 2), round(auc, 2), round(mean_iou, 3), round(avg_fps, 1), txt_out]
+                        if (dname, sname, effective_mname) not in existing_keys:
+                            row = [dname, sname, effective_mname, valid_n, round(prec20, 2), round(auc, 2), round(mean_iou, 3), round(avg_fps, 1), txt_out]
                             with open(csv_file, 'a', newline='') as f:
                                 csv.writer(f).writerow(row)
-                            existing_keys.add((dname, sname, mname))
+                            existing_keys.add((dname, sname, effective_mname))
                         continue
 
                 # Nếu chưa chạy -> load mô hình (nếu chưa load) và chạy GPU
                 if tracker is None:
                     tracker = model_fn()
 
-                pred_boxes, frame_times = run_tracker_on_sequence(tracker, sinfo)
+                pred_boxes, frame_times, reid_stats = run_tracker_on_sequence(
+                    tracker, sinfo, reid_manager=reid_mgr, reid_cfg=reid_cfg
+                )
                 if pred_boxes is None:
                     continue
 
@@ -602,28 +672,32 @@ def main():
                 iou_list.append(mean_iou)
                 fps_list.append(avg_fps)
 
-                pbar.set_postfix({"Prec@20": f"{prec20:.1f}%", "AUC": f"{auc:.1f}%", "FPS": f"{avg_fps:.1f}"})
+                postfix_dict = {"Prec@20": f"{prec20:.1f}%", "AUC": f"{auc:.1f}%", "FPS": f"{avg_fps:.1f}"}
+                if args.use_reid and reid_stats:
+                    postfix_dict["HardLocks"] = reid_stats.get("hard_locks", 0)
+                pbar.set_postfix(postfix_dict)
 
                 row_dict = {
                     "Dataset": dname,
                     "Sequence": sname,
-                    "Model": mname,
+                    "Model": effective_mname,
                     "Frames": valid_n,
                     "Precision_20px": round(prec20, 2),
                     "Success_AUC": round(auc, 2),
                     "Mean_IoU": round(mean_iou, 3),
                     "FPS": round(avg_fps, 1),
-                    "BBox_Path": txt_out
+                    "BBox_Path": txt_out,
+                    "ReID_Stats": reid_stats
                 }
                 results_raw.append(row_dict)
 
                 # GHI LIÊN TỤC VÀO CSV NGAY LẬP TỨC (Không lo mất dữ liệu nếu ngắt đột ngột)
-                if (dname, sname, mname) not in existing_keys:
-                    row = [dname, sname, mname, valid_n, round(prec20, 2), round(auc, 2), round(mean_iou, 3), round(avg_fps, 1), txt_out]
+                if (dname, sname, effective_mname) not in existing_keys:
+                    row = [dname, sname, effective_mname, valid_n, round(prec20, 2), round(auc, 2), round(mean_iou, 3), round(avg_fps, 1), txt_out]
                     with open(csv_file, 'a', newline='') as f:
                         writer = csv.writer(f)
                         writer.writerow(row)
-                    existing_keys.add((dname, sname, mname))
+                    existing_keys.add((dname, sname, effective_mname))
 
                 # Tự động đồng bộ file CSV sang Google Drive sau mỗi chuỗi
                 if drive_backup:
@@ -632,7 +706,7 @@ def main():
                     except Exception:
                         pass
 
-            summary[dname][mname] = {
+            summary[dname][effective_mname] = {
                 "Mean_Precision_20px": round(float(np.mean(p_list)), 2) if p_list else 0.0,
                 "Mean_Success_AUC": round(float(np.mean(a_list)), 2) if a_list else 0.0,
                 "Mean_IoU": round(float(np.mean(iou_list)), 3) if iou_list else 0.0,
@@ -659,10 +733,10 @@ def main():
     for dname, dmodels in summary.items():
         print(f"\n📁 Tập dữ liệu: {dname}")
         print("-" * 65)
-        print(f"{'Mô hình':<15} | {'Prec@20px (%)':<15} | {'Success/AUC (%)':<15} | {'FPS':<10}")
+        print(f"{'Mô hình':<20} | {'Prec@20px (%)':<15} | {'Success/AUC (%)':<15} | {'FPS':<10}")
         print("-" * 65)
         for mname, mmetrics in dmodels.items():
-            print(f"{mname:<15} | {mmetrics['Mean_Precision_20px']:<15.2f} | {mmetrics['Mean_Success_AUC']:<15.2f} | {mmetrics['Mean_FPS']:<10.1f}")
+            print(f"{mname:<20} | {mmetrics['Mean_Precision_20px']:<15.2f} | {mmetrics['Mean_Success_AUC']:<15.2f} | {mmetrics['Mean_FPS']:<10.1f}")
         print("-" * 65)
 
     print(f"\n[+] Đã lưu file tọa độ bounding box tại: {os.path.join(args.output_dir, 'tracking_results')}")

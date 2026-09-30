@@ -1,0 +1,765 @@
+import os
+import sys
+import time
+import argparse
+import yaml
+import cv2
+import torch
+import torch.nn.functional as F
+import numpy as np
+import builtins
+from collections import namedtuple
+from torchvision import transforms
+
+from model import UAVReIDNet, load_checkpoint_verbose
+
+def extract_cnn_feature(model, tensor_frame):
+    with torch.no_grad():
+        feats = model.backbone(tensor_frame)
+        if isinstance(feats, tuple):
+            if isinstance(feats[0], tuple):
+                global_feat = feats[0][0]
+                fs_feat = feats[0][1]
+            else:
+                global_feat = feats[0]
+                fs_feat = feats[1]
+            feats = torch.cat([global_feat, fs_feat], dim=-1)
+    return feats
+
+def compute_reid_embedding(model, seq_feats, visual_feat=None):
+    with torch.no_grad():
+        if visual_feat is None:
+            visual_feat = seq_feats.mean(dim=1)
+        temporal_token, _ = model.temporal_encoder(seq_feats)
+        bn_feat = model.head(visual_feat, temporal_token)
+        bn_feat = F.normalize(bn_feat, p=2, dim=1)
+    return bn_feat
+
+def compute_sharpness(crop_bgr: np.ndarray) -> float:
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+class SlidingWindowBuffer:
+    def __init__(self, window_size: int = 16, stride: int = 2):
+        self.window_size = window_size
+        self.stride = stride
+        self.features = []
+        self.sharpness_scores = []
+        self._frame_counter = 0
+    
+    def should_extract(self) -> bool:
+        result = (self._frame_counter % self.stride == 0)
+        self._frame_counter += 1
+        return result
+    
+    def add(self, feat: torch.Tensor, sharpness: float):
+        self.features.append(feat)
+        self.sharpness_scores.append(sharpness)
+        if len(self.features) > self.window_size:
+            self.features.pop(0)
+            self.sharpness_scores.pop(0)
+    
+    def is_ready(self) -> bool:
+        return len(self.features) >= self.window_size
+    
+    def get_sequence(self) -> torch.Tensor:
+        return torch.stack(self.features, dim=1)
+    
+    def get_weighted_visual_mean(self) -> torch.Tensor:
+        weights = torch.tensor(self.sharpness_scores, dtype=torch.float32)
+        if weights.sum() > 0:
+            weights = weights / weights.sum()
+        else:
+            weights = torch.ones_like(weights) / len(weights)
+        
+        stacked = torch.stack([f.squeeze(0) for f in self.features])
+        return (stacked * weights.unsqueeze(1).to(stacked.device)).sum(dim=0, keepdim=True)
+    
+    def clear(self):
+        self.features.clear()
+        self.sharpness_scores.clear()
+        self._frame_counter = 0
+
+# 🛠️ DEBUG (14/9): bundle trả về đủ mọi tầng của phép fusion để đo được
+# cosine TRƯỚC BatchNorm (raw_feat) vs SAU BatchNorm (fused_feat).
+#   visual_mean    : weighted mean theo sharpness — chỉ dùng cho coarse score
+#   visual_plain   : plain mean — đúng như lúc train, là input của head
+#   temporal_token : đầu ra Mamba
+#   raw_feat       : L2-normalize( cat(visual_plain, temporal_token) )  ← TRƯỚC bnneck
+#   fused_feat     : L2-normalize( bnneck(cat(...)) )                   ← SAU bnneck (fine score)
+FusedBundle = namedtuple(
+    'FusedBundle',
+    ['visual_mean', 'visual_plain', 'temporal_token', 'raw_feat', 'fused_feat']
+)
+
+
+def compute_fused_vector(model, sliding_window):
+    seq_feats = sliding_window.get_sequence()
+    
+    # 1. BẮT BUỘC dùng mean để đưa vào khối Fusion Head (vì lúc train model học bằng mean)
+    # Nếu đưa 1 frame vào Fusion Head, phân phối (variance) bị sai lệch dẫn đến Mamba tính sai bét
+    #
+    # 🛠️ FIX: Fused Feature (qua head) phải dùng PLAIN MEAN giống training
+    # (model.py: visual_feat = feats.mean(dim=1)). Weighted mean (theo sharpness)
+    # chỉ nên dùng cho COARSE score (backbone feature), KHÔNG đưa vào head,
+    # vì head được train với plain mean → weighted mean làm fused feature lệch → fine score thấp.
+    visual_mean = sliding_window.get_weighted_visual_mean()   # dùng cho coarse score (không qua head)
+    visual_plain = seq_feats.mean(dim=1)                     # giống hệt training → cho head
+    
+    # Tính temporal_token + fused_feat MỘT LẦN (không gọi temporal_encoder 2 lần)
+    with torch.no_grad():
+        temporal_token, _ = model.temporal_encoder(seq_feats)
+        # Đầu vào THÔ của head (trước bnneck) — chính là vector bị BatchNorm1d biến đổi
+        feat = torch.cat([visual_plain, temporal_token], dim=-1)
+        raw_feat = F.normalize(feat, p=2, dim=1)
+        
+        bn_feat = model.head(visual_plain, temporal_token)
+        fused_feat = F.normalize(bn_feat, p=2, dim=1)
+    
+    return FusedBundle(visual_mean, visual_plain, temporal_token, raw_feat, fused_feat)
+
+class TwoTierMemoryBank:
+    def __init__(self, max_anchor: int = 10, max_recent: int = 30):
+        self.max_anchor = max_anchor
+        self.max_recent = max_recent
+        self.anchor_bank = []
+        self.recent_bank = []
+    
+    @staticmethod
+    def _make_entry(visual_feat, fused_feat, temporal_token=None,
+                    visual_plain=None, raw_feat=None):
+        """Lưu đủ 5 tầng vector để debug: coarse(weighted) / plain / temporal / PRE-BN / POST-BN."""
+        def _norm(t):
+            return F.normalize(t, p=2, dim=1) if t is not None else None
+        return {
+            "visual": _norm(visual_feat),
+            "visual_plain": _norm(visual_plain),
+            "fused": _norm(fused_feat),
+            "raw": _norm(raw_feat),
+            "temporal": _norm(temporal_token),
+        }
+    
+    def add_anchor(self, visual_feat: torch.Tensor, fused_feat: torch.Tensor,
+                   temporal_token: torch.Tensor = None, visual_plain: torch.Tensor = None,
+                   raw_feat: torch.Tensor = None):
+        if len(self.anchor_bank) < self.max_anchor:
+            self.anchor_bank.append(self._make_entry(
+                visual_feat, fused_feat, temporal_token, visual_plain, raw_feat))
+    
+    def add_recent(self, visual_feat: torch.Tensor, fused_feat: torch.Tensor,
+                   temporal_token: torch.Tensor = None, visual_plain: torch.Tensor = None,
+                   raw_feat: torch.Tensor = None):
+        self.recent_bank.append(self._make_entry(
+            visual_feat, fused_feat, temporal_token, visual_plain, raw_feat))
+        if len(self.recent_bank) > self.max_recent:
+            self.recent_bank.pop(0)
+    
+    def _max_sim(self, query_feat: torch.Tensor, key: str) -> float:
+        """Cosine similarity lớn nhất giữa query và mọi entry có trường `key`."""
+        query = F.normalize(query_feat, p=2, dim=1)
+        max_sim = 0.0
+        for entry in self.anchor_bank + self.recent_bank:
+            ref = entry.get(key)
+            if ref is not None:
+                sim = torch.mm(query, ref.t()).item()
+                max_sim = max(max_sim, sim)
+        return max_sim
+    
+    def coarse_score(self, query_feat: torch.Tensor) -> float:
+        """Coarse: visual weighted-mean (KHÔNG qua head)."""
+        return self._max_sim(query_feat, "visual")
+    
+    # DEBUG: so sánh riêng visual_plain (đúng input của head) với anchor
+    def visual_plain_score(self, query_visual_plain: torch.Tensor) -> float:
+        return self._max_sim(query_visual_plain, "visual_plain")
+    
+    # DEBUG: so sánh riêng temporal token với anchor
+    def temporal_score(self, query_temporal: torch.Tensor) -> float:
+        return self._max_sim(query_temporal, "temporal")
+    
+    # DEBUG: cosine TRƯỚC BatchNorm1d (cat thô đã L2-normalize)
+    def raw_score(self, query_raw: torch.Tensor) -> float:
+        return self._max_sim(query_raw, "raw")
+    
+    # Fine: cosine SAU BatchNorm1d — đây là score pipeline đang dùng để HARD LOCK
+    def fine_score(self, query_fused: torch.Tensor) -> float:
+        return self._max_sim(query_fused, "fused")
+    
+    def is_empty(self) -> bool:
+        return len(self.anchor_bank) == 0 and len(self.recent_bank) == 0
+    
+    def size_info(self) -> str:
+        return f"Anchor: {len(self.anchor_bank)}/{self.max_anchor} | Recent: {len(self.recent_bank)}/{self.max_recent}"
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Sequence Inference for UAV ReID (OOP Pipeline)")
+    parser.add_argument("--seq-dir", type=str, default=None)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--config", type=str, default="configs/config_jetson.yaml")
+    parser.add_argument("--out-dir", type=str, default=None, help="Output directory")
+    return parser.parse_args()
+
+def crop_and_pad(frame, bbox, padding):
+    h, w = frame.shape[:2]
+    x, y, bw, bh = bbox
+    
+    pad_w, pad_h = int(bw * padding), int(bh * padding)
+    x1 = max(0, x - pad_w)
+    y1 = max(0, y - pad_h)
+    x2 = min(w, x + bw + pad_w)
+    y2 = min(h, y + bh + pad_h)
+    
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return frame[y1:y2, x1:x2]
+
+class SeqReIDPipeline:
+    T0_INIT = "T0_INIT"
+    T1_LOST = "T1_LOST"
+    T2_SEARCH = "T2_SEARCH"
+    T3_VERIFIED = "T3_VERIFIED"
+    
+    def __init__(self, model, device, cfg):
+        self.model = model
+        self.device = device
+        self.state = self.T0_INIT
+        
+        self.stride = cfg.get('stride', 2)
+        self.num_frames = cfg.get('num_frames', 16)
+        self.soft_lock_threshold = cfg.get('soft_lock_threshold', 0.50)
+        self.reid_threshold = cfg.get('reid_threshold', 0.75)
+        self.hijack_threshold = cfg.get('hijack_threshold', 0.40)
+        self.hijack_check_count = cfg.get('hijack_check_count', 5)
+        self.update_interval_sec = cfg.get('update_interval_sec', 2.0)
+        self.bbox_padding = cfg.get('bbox_padding', 0.2)
+        # 🛠️ DEBUG (14/9): in tách cosine TRƯỚC BN (raw) vs SAU BN (fused).
+        # Bật/tắt bằng `debug_sim` trong block `infer` của config.
+        self.debug_sim = cfg.get('debug_sim', True)
+        
+        self.memory_bank = TwoTierMemoryBank(
+            max_anchor=cfg.get('max_anchor_size', 10),
+            max_recent=cfg.get('max_recent_size', 30)
+        )
+        self.sliding_window = SlidingWindowBuffer(self.num_frames, self.stride)
+        self.soft_lock_buffer = SlidingWindowBuffer(self.num_frames, stride=1)
+        
+        self.last_update_time = 0.0
+        self._hijack_checks_remaining = 0
+        
+        self.metrics_cnn_times = []
+        self.metrics_mamba_times = []
+        self.false_alarms = 0
+        self.reid_latency_frames = []
+        self.reappeared_frame_idx = -1
+        # Tích luỹ để tổng hợp cuối sequence (trả lời câu hỏi: BN có phá cosine không?)
+        self.debug_pre_bn_scores = []
+        self.debug_post_bn_scores = []
+        
+    def _log_sim_breakdown(self, frame_idx, bundle, fused_score, tag="sim"):
+        """
+        In breakdown cosine của cùng một truy vấn (cùng cửa sổ) với Memory Bank:
+          visual_shot  : weighted mean (coarse)      — ngoài head
+          visual_plain : plain mean (input head)     — ngoài head
+          temporal     : token Mamba                 — input head
+          PRE-BN raw   : cat(visual_plain, temporal) — ĐẦU VÀO bnneck
+          POST-BN fused: bnneck(...)                 — đầu ra bnneck = fine score
+        Cách đọc: raw cao (>=0.8) mà fused thấp hơn `reid_threshold` → bnneck là mắt xích đang
+                  chặn HARD LOCK (nhưng CHƯA nói được BN có hại hay không — cần TAR@FAR).
+                  raw thấp sẵn (~ temporal)          → vấn đề nằm ở feature (temporal/dữ liệu train).
+        """
+        if not self.debug_sim:
+            return
+        vis = self.memory_bank.coarse_score(bundle.visual_mean)
+        vis_plain = self.memory_bank.visual_plain_score(bundle.visual_plain)
+        temp = self.memory_bank.temporal_score(bundle.temporal_token)
+        raw = self.memory_bank.raw_score(bundle.raw_feat)
+        self.debug_pre_bn_scores.append(raw)
+        self.debug_post_bn_scores.append(fused_score)
+        print(f"[{frame_idx}] DEBUG {tag}: visual_shot={vis:.3f} | visual_plain={vis_plain:.3f} | "
+              f"temporal={temp:.3f} || PRE-BN raw={raw:.3f} -> POST-BN fused={fused_score:.3f} "
+              f"(BN delta={raw - fused_score:+.3f})")
+        
+    def _transition_to_lost(self, frame_idx):
+        print(f"[{frame_idx}] Target LOST! -> T1_LOST")
+        self.state = self.T1_LOST
+        self.sliding_window.clear()
+        self.soft_lock_buffer.clear()
+        
+    def process_frame(self, frame, bbox, is_absent, frame_idx, transform):
+        valid_bbox = bbox[2] > 0 and bbox[3] > 0
+        current_time = time.time()
+        
+        if self.state in [self.T0_INIT, self.T3_VERIFIED]:
+            if is_absent or not valid_bbox:
+                if len(self.sliding_window.features) > 0:
+                    # Pad the sliding window if it's not ready
+                    while not self.sliding_window.is_ready():
+                        self.sliding_window.add(self.sliding_window.features[-1], self.sliding_window.sharpness_scores[-1])
+                        
+                    if self.device.type == 'cuda': torch.cuda.synchronize()
+                    t0 = time.time()
+                    bundle = compute_fused_vector(self.model, self.sliding_window)
+                    if self.device.type == 'cuda': torch.cuda.synchronize()
+                    self.metrics_mamba_times.append((time.time() - t0) * 1000)
+                    if len(self.memory_bank.anchor_bank) < self.memory_bank.max_anchor:
+                        self.memory_bank.add_anchor(bundle.visual_mean, bundle.fused_feat, bundle.temporal_token,
+                                                    bundle.visual_plain, bundle.raw_feat)
+                    else:
+                        self.memory_bank.add_recent(bundle.visual_mean, bundle.fused_feat, bundle.temporal_token,
+                                                    bundle.visual_plain, bundle.raw_feat)
+                    print(f"[{frame_idx}] Last-moment Memory Bank update before LOST. Bank: {self.memory_bank.size_info()}")
+                self._transition_to_lost(frame_idx)
+                return
+                
+            crop = crop_and_pad(frame, bbox, self.bbox_padding)
+            if crop is not None and self.sliding_window.should_extract():
+                sharpness = compute_sharpness(crop)
+                tensor_frame = transform(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).unsqueeze(0).to(self.device)
+                if self.device.type == 'cuda': torch.cuda.synchronize()
+                t0 = time.time()
+                feat_2560 = extract_cnn_feature(self.model, tensor_frame)
+                if self.device.type == 'cuda': torch.cuda.synchronize()
+                self.metrics_cnn_times.append((time.time() - t0) * 1000)
+                self.sliding_window.add(feat_2560, sharpness)
+                
+            time_elapsed = current_time - self.last_update_time
+            if self.sliding_window.is_ready() and time_elapsed >= self.update_interval_sec:
+                if self.device.type == 'cuda': torch.cuda.synchronize()
+                t0 = time.time()
+                bundle = compute_fused_vector(self.model, self.sliding_window)
+                if self.device.type == 'cuda': torch.cuda.synchronize()
+                self.metrics_mamba_times.append((time.time() - t0) * 1000)
+                
+                # Anti-Hijack: so sánh với bank CŨ trước khi thêm vector hiện tại vào bank
+                if self.state == self.T3_VERIFIED and self._hijack_checks_remaining > 0:
+                    hijack_score = self.memory_bank.fine_score(bundle.fused_feat)
+                    self._hijack_checks_remaining -= 1
+                    print(f"[{frame_idx}] Anti-Hijack check #{self.hijack_check_count - self._hijack_checks_remaining}: score={hijack_score:.3f}")
+                    self._log_sim_breakdown(frame_idx, bundle, hijack_score, tag="anti-hijack")
+                    if hijack_score < self.hijack_threshold:
+                        print(f"[{frame_idx}] WARNING: HIJACK DETECTED! -> T1_LOST")
+                        self._transition_to_lost(frame_idx)
+                        return
+                
+                if len(self.memory_bank.anchor_bank) < self.memory_bank.max_anchor:
+                    self.memory_bank.add_anchor(bundle.visual_mean, bundle.fused_feat, bundle.temporal_token,
+                                                bundle.visual_plain, bundle.raw_feat)
+                    print(f"[{frame_idx}] Anchor updated. {self.memory_bank.size_info()}")
+                else:
+                    self.memory_bank.add_recent(bundle.visual_mean, bundle.fused_feat, bundle.temporal_token,
+                                                bundle.visual_plain, bundle.raw_feat)
+                    print(f"[{frame_idx}] Recent updated. {self.memory_bank.size_info()}")
+                
+                self.last_update_time = current_time
+
+        elif self.state == self.T1_LOST:
+            if not is_absent and valid_bbox:
+                print(f"[{frame_idx}] UAV reappeared from GT. -> T2_SEARCH")
+                self.state = self.T2_SEARCH
+                self.reappeared_frame_idx = frame_idx
+                self.soft_lock_buffer.clear()
+                
+        elif self.state == self.T2_SEARCH:
+            if is_absent or not valid_bbox:
+                print(f"[{frame_idx}] UAV lost during T2_SEARCH. -> T1_LOST")
+                self._transition_to_lost(frame_idx)
+                return
+                
+            crop = crop_and_pad(frame, bbox, self.bbox_padding)
+            if crop is not None:
+                sharpness = compute_sharpness(crop)
+                tensor_frame = transform(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).unsqueeze(0).to(self.device)
+                if self.device.type == 'cuda': torch.cuda.synchronize()
+                t0 = time.time()
+                feat_2560 = extract_cnn_feature(self.model, tensor_frame)
+                if self.device.type == 'cuda': torch.cuda.synchronize()
+                self.metrics_cnn_times.append((time.time() - t0) * 1000)
+                
+                # Nếu đang trong quá trình thu thập Soft Lock, tiếp tục thu thập vô điều kiện
+                if len(self.soft_lock_buffer.features) > 0:
+                    self.soft_lock_buffer.add(feat_2560, sharpness)
+                    print(f"[{frame_idx}] Soft Lock collecting: {len(self.soft_lock_buffer.features)}/{self.num_frames}")
+                else:
+                    if self.memory_bank.is_empty():
+                        # Chưa có target identity (sequence bắt đầu bằng absent): bbox từ GT chính là target
+                        coarse_score = 1.0
+                    else:
+                        coarse_score = self.memory_bank.coarse_score(feat_2560)
+                    if coarse_score >= self.soft_lock_threshold:
+                        self.soft_lock_buffer.add(feat_2560, sharpness)
+                        print(f"[{frame_idx}] Soft Lock collecting: 1/{self.num_frames} (coarse={coarse_score:.3f})")
+                    else:
+                        print(f"[{frame_idx}] Coarse FAILED! (coarse={coarse_score:.3f} < {self.soft_lock_threshold})")
+                
+                # Đủ k frame -> chạy Lọc Tinh
+                if self.soft_lock_buffer.is_ready():
+                    if self.device.type == 'cuda': torch.cuda.synchronize()
+                    t0 = time.time()
+                    bundle = compute_fused_vector(self.model, self.soft_lock_buffer)
+                    if self.device.type == 'cuda': torch.cuda.synchronize()
+                    mamba_time = (time.time() - t0) * 1000
+                    self.metrics_mamba_times.append(mamba_time)
+                    
+                    if self.memory_bank.is_empty():
+                        fine_score = 1.0
+                    else:
+                        fine_score = self.memory_bank.fine_score(bundle.fused_feat)
+                        # 🛠️ DEBUG (14/9): breakdown đầy đủ, đặc biệt là PRE-BN raw vs POST-BN fused
+                        self._log_sim_breakdown(frame_idx, bundle, fine_score, tag="re-acquire")
+                    if fine_score >= self.reid_threshold:
+                        latency = frame_idx - self.reappeared_frame_idx
+                        self.reid_latency_frames.append(latency)
+                        print(f"[{frame_idx}] HARD LOCK! (fine={fine_score:.3f} >= {self.reid_threshold}) Latency: {latency} frames")
+                        self.state = self.T3_VERIFIED
+                        self._hijack_checks_remaining = self.hijack_check_count
+                        self.last_update_time = time.time()
+                        
+                        if len(self.memory_bank.anchor_bank) < self.memory_bank.max_anchor:
+                            self.memory_bank.add_anchor(bundle.visual_mean, bundle.fused_feat, bundle.temporal_token,
+                                                        bundle.visual_plain, bundle.raw_feat)
+                        else:
+                            self.memory_bank.add_recent(bundle.visual_mean, bundle.fused_feat, bundle.temporal_token,
+                                                        bundle.visual_plain, bundle.raw_feat)
+                            
+                        self.sliding_window = self.soft_lock_buffer
+                        self.sliding_window.stride = self.stride
+                        self.soft_lock_buffer = SlidingWindowBuffer(self.num_frames, stride=1)
+                    else:
+                        self.false_alarms += 1
+                        print(f"[{frame_idx}] Fine FAILED! (fine={fine_score:.3f} < {self.reid_threshold}) -> Rolling Window...")
+                        self.soft_lock_buffer.features.pop(0)
+                        self.soft_lock_buffer.sharpness_scores.pop(0)
+
+    def draw_ui(self, display_frame, bbox, frame_idx):
+        color = (0, 0, 255)
+        text = "LOST"
+        if self.state in [self.T0_INIT, self.T3_VERIFIED]:
+            color = (0, 255, 0)
+            text = "TRACKING (HARD LOCK)"
+        elif self.state == self.T2_SEARCH:
+            color = (255, 255, 0)
+            text = f"SEARCHING ({len(self.soft_lock_buffer.features)}/{self.num_frames})"
+            
+        cv2.putText(display_frame, f"State: {self.state}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.putText(display_frame, f"Bank: {self.memory_bank.size_info()}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        if bbox[2] > 0 and bbox[3] > 0 and self.state != self.T1_LOST:
+            x, y, bw, bh = bbox
+            cv2.rectangle(display_frame, (x, y), (x+bw, y+bh), color, 2)
+            cv2.putText(display_frame, text, (x, max(0, y-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+
+def run_sequence(seq_dir, model, device, transform, cfg, inf_cfg, out_base=None):
+    seq_name = os.path.basename(os.path.normpath(seq_dir))
+    video_path = os.path.join(seq_dir, f"{seq_name}.mp4")
+    gt_path = os.path.join(seq_dir, "groundtruth_rect.txt")
+    absent_path = os.path.join(seq_dir, "absent.txt")
+    
+    if out_base:
+        out_dir = os.path.join(out_base, seq_name)
+    else:
+        out_dir = inf_cfg.get('out_dir', f"infer_output/{seq_name}")
+    os.makedirs(out_dir, exist_ok=True)
+    
+    with open(os.path.join(out_dir, "config_used.yaml"), "w") as f:
+        yaml.dump(cfg, f, default_flow_style=False)
+    
+    metrics_path = os.path.join(out_dir, "metrics.txt")
+    metrics_file = open(metrics_path, "w")
+    _orig_print = builtins.print
+    def custom_print(*args_p, **kwargs_p):
+        msg = " ".join(str(a) for a in args_p)
+        _orig_print(msg, **kwargs_p)
+        if not metrics_file.closed:
+            metrics_file.write(msg + "\n")
+            metrics_file.flush()
+    builtins.print = custom_print
+
+    output_video_name = inf_cfg.get('output_video', 'output.mp4')
+    final_output_path = os.path.join(out_dir, os.path.basename(output_video_name))
+    
+    # Removed incorrect model initialization
+    
+    bboxes = []
+    if os.path.exists(gt_path):
+        with open(gt_path, "r") as f:
+            for line in f:
+                parts = line.strip().replace(',', ' ').split()
+                if len(parts) >= 4:
+                    bboxes.append([int(float(p)) for p in parts[:4]])
+                else:
+                    bboxes.append([0, 0, 0, 0])
+                    
+    absent = []
+    if os.path.exists(absent_path):
+        with open(absent_path, "r") as f:
+            absent = [int(line.strip()) for line in f if line.strip().isdigit()]
+    # Hỗ trợ cả file video .mp4 và thư mục chứa chuỗi ảnh (.jpg/.png)
+    has_video = os.path.exists(video_path)
+    img_files = []
+    if not has_video:
+        cand_dirs = [seq_dir, os.path.join(seq_dir, "img"), os.path.join(seq_dir, "images")]
+        for cd in cand_dirs:
+            if os.path.exists(cd):
+                found = sorted([
+                    os.path.join(cd, f) for f in os.listdir(cd)
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))
+                ])
+                if found:
+                    img_files = found
+                    break
+
+    if not has_video and not img_files:
+        print(f"Error: Không tìm thấy video ({video_path}) hoặc chuỗi ảnh (.jpg) trong {seq_dir}.")
+        metrics_file.close()
+        builtins.print = _orig_print
+        return None
+
+    cap = None
+    if has_video:
+        cap = cv2.VideoCapture(video_path)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps_video = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    else:
+        first_img = cv2.imread(img_files[0])
+        if first_img is None:
+            print(f"Error: Không thể đọc ảnh đầu tiên tại: {img_files[0]}")
+            metrics_file.close()
+            builtins.print = _orig_print
+            return None
+        height, width = first_img.shape[:2]
+        fps_video = 30.0
+        total_frames = len(img_files)
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out_vid = cv2.VideoWriter(final_output_path, fourcc, fps_video, (width, height))
+    
+    pipeline = SeqReIDPipeline(model, device, inf_cfg)
+    
+    frame_idx = 0
+    print(f"Starting OOP Sequence Inference Stream for {seq_name} ({total_frames} frames)...")
+    
+    total_processing_time = 0.0
+    
+    # Cảnh báo nếu absent.txt bị cắt ngắn — trước đây mặc định True (coi là "mất") 
+    # làm pipeline KHÔNG BAO GIỜ re-acquire → latency N/A âm thầm.
+    if absent and len(absent) < len(bboxes):
+        print(f" ⚠️ CẢNH BÁO: absent.txt có {len(absent)} dòng < GT {len(bboxes)} frame. "
+              f"Các frame thiếu sẽ được coi là PRESENT (is_absent=False) để pipeline có thể re-acquire.")
+
+    for frame_idx in range(total_frames):
+        if has_video:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                break
+        else:
+            frame = cv2.imread(img_files[frame_idx])
+            if frame is None:
+                break
+            
+        # Mặc định is_absent = False (present) khi absent.txt thiếu dòng.
+        # Trước đây là True (absent) → target bị coi là mất vĩnh viễn ở các frame bị cắt → kết quả tệ âm thầm.
+        is_absent = (absent[frame_idx] == 1) if frame_idx < len(absent) else False
+        bbox = bboxes[frame_idx] if frame_idx < len(bboxes) else [0,0,0,0]
+        
+        t_start = time.time()
+        display_frame = frame.copy()
+        
+        pipeline.process_frame(frame, bbox, is_absent, frame_idx, transform)
+        pipeline.draw_ui(display_frame, bbox, frame_idx)
+        
+        out_vid.write(display_frame)
+        if device.type == 'cuda': torch.cuda.synchronize()
+        total_processing_time += time.time() - t_start
+
+    if cap is not None:
+        cap.release()
+    out_vid.release()
+    print("Inference completed!")
+    
+    # Generate Performance Metrics
+    metrics_report = ["\n--- PERFORMANCE METRICS ---"]
+    avg_cnn = 0.0
+    avg_mamba = 0.0
+    throughput = 0.0
+    
+    if pipeline.metrics_cnn_times:
+        avg_cnn = np.mean(pipeline.metrics_cnn_times)
+        metrics_report.append(f"Avg CNN Feature Extraction : {avg_cnn:.2f} ms")
+        
+    throughput = frame_idx / total_processing_time if total_processing_time > 0 else 0.0
+    metrics_report.append(f"Avg System Throughput      : {throughput:.2f} FPS")
+        
+    if pipeline.metrics_mamba_times:
+        avg_mamba = np.mean(pipeline.metrics_mamba_times)
+        metrics_report.append(f"Avg Mamba + Head Time      : {avg_mamba:.2f} ms")
+        
+    if pipeline.reid_latency_frames:
+        avg_lat = np.mean(pipeline.reid_latency_frames)
+        metrics_report.append(f"Re-acquisition Latency     : {avg_lat:.2f} frames")
+    else:
+        metrics_report.append("Re-acquisition Latency     : N/A")
+        
+    metrics_report.append(f"False Alarms (Fine Fails)  : {pipeline.false_alarms}")
+    
+    # 🛠️ DEBUG (14/9): tổng hợp PRE-BN vs POST-BN để trả lời dứt khoát câu hỏi
+    # "BatchNorm1d trong ReIDHead có phá cosine similarity không?"
+    pre_bn_mean = float(np.mean(pipeline.debug_pre_bn_scores)) if pipeline.debug_pre_bn_scores else -1.0
+    post_bn_mean = float(np.mean(pipeline.debug_post_bn_scores)) if pipeline.debug_post_bn_scores else -1.0
+    if pre_bn_mean >= 0 and post_bn_mean >= 0:
+        n_pairs = len(pipeline.debug_pre_bn_scores)
+        bn_delta = pre_bn_mean - post_bn_mean
+        thr = pipeline.reid_threshold
+        if pre_bn_mean < 0.70:
+            verdict = ("raw cũng thấp sẵn -> lỗi nằm ở feature (temporal/dữ liệu train), KHÔNG phải BN")
+        elif bn_delta < 0.05:
+            verdict = "BN gần như không ảnh hưởng cosine"
+        elif pre_bn_mean >= thr > post_bn_mean:
+            verdict = (f"BN nén cosine xuống dưới ngưỡng {thr:.2f} -> BN là mắt xích đang chặn HARD LOCK. "
+                       f"LƯU Ý: raw cao hơn KHÔNG chứng minh phân biệt tốt hơn (impostor cũng cao hơn); "
+                       f"cần TAR@FAR: calibrate_threshold.py rồi evaluate_reid.py --space pre_bn")
+        else:
+            side = "trên" if post_bn_mean >= thr else "dưới"
+            verdict = (f"BN nén cosine {bn_delta:.3f}, nhưng cả raw lẫn fused đều đang {side} ngưỡng {thr:.2f} "
+                       f"-> BN không phải nút thắt của sequence này")
+        metrics_report.append(f"Sim PRE-BN  (raw concat)   : {pre_bn_mean:.3f} (n={n_pairs})")
+        metrics_report.append(f"Sim POST-BN (fused/fine)   : {post_bn_mean:.3f}")
+        metrics_report.append(f"BN degradation (pre - post) : {bn_delta:+.3f} -> {verdict}")
+    
+    print("\n".join(metrics_report))
+    metrics_file.close()
+    builtins.print = _orig_print
+    
+    mean_latency = np.mean(pipeline.reid_latency_frames) if pipeline.reid_latency_frames else -1.0
+    return (avg_cnn, avg_mamba, throughput, mean_latency, pipeline.false_alarms,
+            pipeline.debug_pre_bn_scores, pipeline.debug_post_bn_scores)
+
+def main():
+    args = parse_args()
+    cfg = {}
+    if args.config and os.path.exists(args.config):
+        with open(args.config, 'r') as f:
+            cfg = yaml.safe_load(f)
+            
+    inf_cfg = cfg.get('infer', {})
+    seq_dir_arg = args.seq_dir or inf_cfg.get('seq_dir')
+    if not seq_dir_arg:
+        print("Error: --seq-dir must be provided.")
+        return
+
+    print(f"Initializing Mamba ReID Model...")
+    backbone_type = inf_cfg.get('backbone', 'resnet50_ibn')
+    model = UAVReIDNet(backbone=backbone_type)
+    model_path = args.checkpoint or inf_cfg.get('model_path', './best_model.pth')
+    if os.path.exists(model_path):
+        # 🛠️ (14/9): báo cáo đầy đủ missing/unexpected/shape-mismatch thay vì "Loaded" mù quáng.
+        # Cảnh báo nghiêm trọng nếu `backbone.*` không được nạp (visual branch chạy pretrain,
+        # trong khi temporal/head được train trên feature khác → mọi score đều đáng ngờ).
+        load_checkpoint_verbose(model, model_path, tag="infer")
+        print("Model loaded successfully.")
+    else:
+        print(f"Warning: Checkpoint {model_path} not found. Running with random weights.")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+    
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((256, 256)),
+        transforms.CenterCrop((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    if seq_dir_arg.lower() == "all":
+        # Ưu tiên: inf_cfg.test_dir > inf_cfg.data_root > paths.raw_data_dir/Test > fallback ./data/UAV-Anti-UAV/Test
+        configured_test = inf_cfg.get('test_dir') or inf_cfg.get('data_root')
+        if not configured_test:
+            raw_data = cfg.get('paths', {}).get('raw_data_dir', '')
+            if raw_data:
+                configured_test = os.path.join(raw_data, 'Test') if not raw_data.endswith('Test') else raw_data
+        base_test_dir = configured_test if (configured_test and os.path.exists(configured_test)) else "./data/UAV-Anti-UAV/Test"
+        if not os.path.exists(base_test_dir):
+            print(f"Error: Không tìm thấy thư mục test tại: {base_test_dir}")
+            return
+        all_dirs = [os.path.join(base_test_dir, d) for d in sorted(os.listdir(base_test_dir)) if os.path.isdir(os.path.join(base_test_dir, d))]
+        valid_seqs = all_dirs
+        disappearance_seqs = 0
+        for d in all_dirs:
+            absent_path = os.path.join(d, "absent.txt")
+            if os.path.exists(absent_path):
+                with open(absent_path, "r") as f:
+                    absent = [int(line.strip()) for line in f if line.strip().isdigit()]
+                if 1 in absent:
+                    disappearance_seqs += 1
+        print(f"Tổng số chuỗi test được đưa vào suy luận: {len(valid_seqs)} sequences (trong đó có {disappearance_seqs} sequences chứa sự kiện biến mất).")
+        
+        all_cnn = []
+        all_mamba = []
+        all_throughput = []
+        all_latency = []
+        all_false_alarms = []
+        all_pre_bn = []
+        all_post_bn = []
+        
+        base_out_dir = args.out_dir or inf_cfg.get('out_dir', './infer_output')
+        print(f"Batch processing: Results will be saved in base directory: {base_out_dir}")
+        for sdir in valid_seqs:
+            res = run_sequence(sdir, model, device, transform, cfg, inf_cfg, out_base=base_out_dir)
+            if res:
+                c, m, t, l, f, pre_bn, post_bn = res
+                all_cnn.append(c)
+                all_mamba.append(m)
+                all_throughput.append(t)
+                if l >= 0:
+                    all_latency.append(l)
+                all_false_alarms.append(f)
+                all_pre_bn.extend(pre_bn)
+                all_post_bn.extend(post_bn)
+                
+        # Calculate averages
+        avg_cnn = np.mean(all_cnn) if all_cnn else 0.0
+        avg_mamba = np.mean(all_mamba) if all_mamba else 0.0
+        avg_throughput = np.mean(all_throughput) if all_throughput else 0.0
+        avg_latency = np.mean(all_latency) if all_latency else 0.0
+        sum_false_alarms = int(np.sum(all_false_alarms)) if all_false_alarms else 0
+        
+        pre_bn_mean = float(np.mean(all_pre_bn)) if all_pre_bn else -1.0
+        post_bn_mean = float(np.mean(all_post_bn)) if all_post_bn else -1.0
+        bn_lines = []
+        if pre_bn_mean >= 0 and post_bn_mean >= 0:
+            bn_lines = [
+                f"Sim PRE-BN  (raw concat)   : {pre_bn_mean:.3f} (n={len(all_pre_bn)})",
+                f"Sim POST-BN (fused/fine)   : {post_bn_mean:.3f}",
+                f"BN degradation (pre - post) : {pre_bn_mean - post_bn_mean:+.3f}",
+            ]
+        
+        print("\n=== AGGREGATED METRICS ===")
+        print(f"Avg CNN Feature Extraction : {avg_cnn:.2f} ms")
+        print(f"Avg System Throughput      : {avg_throughput:.2f} FPS")
+        print(f"Avg Mamba + Head Time      : {avg_mamba:.2f} ms")
+        print(f"Avg Re-acquisition Latency : {avg_latency:.2f} frames")
+        print(f"Total False Alarms         : {sum_false_alarms}")
+        for line in bn_lines:
+            print(line)
+        
+        # Save to summary text file
+        os.makedirs(base_out_dir, exist_ok=True)
+        with open(os.path.join(base_out_dir, "summary_metrics.txt"), "w") as sf:
+            sf.write("=== AGGREGATED METRICS ===\n")
+            sf.write(f"Avg CNN Feature Extraction : {avg_cnn:.2f} ms\n")
+            sf.write(f"Avg System Throughput      : {avg_throughput:.2f} FPS\n")
+            sf.write(f"Avg Mamba + Head Time      : {avg_mamba:.2f} ms\n")
+            sf.write(f"Avg Re-acquisition Latency : {avg_latency:.2f} frames\n")
+            sf.write(f"Total False Alarms         : {sum_false_alarms}\n")
+            for line in bn_lines:
+                sf.write(line + "\n")
+            
+    else:
+        run_sequence(seq_dir_arg, model, device, transform, cfg, inf_cfg, out_base=args.out_dir)
+
+if __name__ == "__main__":
+    main()
