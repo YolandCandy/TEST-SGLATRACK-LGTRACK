@@ -184,6 +184,9 @@ class ReIDModelManager:
         if path and os.path.exists(path):
             return path
         candidates = [
+            "/kaggle/input/models/yolandcandy/dino-convnext-reid/pytorch/default/1/best_model.pth",
+            "/kaggle/input/models/yolandcandy/dino-convnext-reid/pytorch/default/1/best_model_dino_convnext.pth",
+            "/kaggle/input/models/yolandcandy/dino-convnext-reid/pytorch/default/1/best_model.pth.tar",
             "/kaggle/working/best_model.pth",
             "/kaggle/working/checkpoints/best_model.pth",
             "/kaggle/input/uav-reid-weights/best_model.pth",
@@ -196,6 +199,19 @@ class ReIDModelManager:
         for c in candidates:
             if os.path.exists(c):
                 return c
+
+        # Tự động quét đệ quy trong /kaggle/input (Model Hub hoặc Dataset Hub)
+        if os.path.exists('/kaggle/input'):
+            import glob
+            # 1. Tìm các file best_model*.pth trong thư mục reid/convnext/models
+            matched = glob.glob('/kaggle/input/**/best_model*.pth', recursive=True)
+            if matched:
+                return matched[0]
+            # 2. Tìm bất kỳ file checkpoint ReID nào
+            matched_all = glob.glob('/kaggle/input/**/*reid*.pth', recursive=True)
+            if matched_all:
+                return matched_all[0]
+
         return None
 
     def _init_model(self):
