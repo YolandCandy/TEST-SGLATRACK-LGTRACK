@@ -516,12 +516,13 @@ def main():
     parser.add_argument('--models', type=str, default='lgtrack', choices=['all', 'sglatrack', 'lgtrack'], help='Mô hình đánh giá (mặc định: lgtrack)')
     parser.add_argument('--output_dir', type=str, default=os.path.join(ROOT_DIR, 'results'), help='Thư mục lưu kết quả')
     
-    # Các tham số cho luồng Detection - Tracking - ReID (Chiến lược A)
-    parser.add_argument('--use_reid', action='store_true', help='Kích hoạt pipeline Detection-Tracking-ReID (Chiến lược A)')
+    # Các tham số cho luồng Detection - Tracking - ReID (Chiến lược A / B)
+    parser.add_argument('--use_reid', action='store_true', help='Kích hoạt pipeline Detection-Tracking-ReID')
+    parser.add_argument('--reid_strategy', type=str, default='B', choices=['A', 'B'], help='Chiến lược ReID: B (Shadow Tracking - Khởi động mềm) hoặc A (Strict ReID - An toàn tuyệt đối)')
     parser.add_argument('--reid_weights', type=str, default='', help='Đường dẫn checkpoint ReID (mặc định tự động tìm)')
     parser.add_argument('--reid_backbone', type=str, default='dinov3_convnext', choices=['dinov3_convnext', 'resnet50_ibn'], help='Backbone của UAVReIDNet')
-    parser.add_argument('--reid_threshold', type=float, default=0.75, help='Ngưỡng xác thực Hard Lock (ReID Fine score)')
-    parser.add_argument('--soft_lock_threshold', type=float, default=0.30, help='Ngưỡng Soft Lock (Coarse score)')
+    parser.add_argument('--reid_threshold', type=float, default=0.70, help='Ngưỡng xác thực Hard Lock (ReID Fine score, mặc định tối ưu: 0.70)')
+    parser.add_argument('--soft_lock_threshold', type=float, default=0.30, help='Ngưỡng Soft Lock (Coarse score, mặc định: 0.30)')
     parser.add_argument('--reid_frames', type=int, default=12, help='Độ dài cửa sổ Mamba (mặc định: 12 frames)')
     args = parser.parse_args()
 
@@ -542,8 +543,9 @@ def main():
         if not HAS_REID_PIPELINE:
             print("[!] CẢNH BÁO: Không tìm thấy reid_tracker_pipeline. Chạy tracking thuần.")
         else:
-            print("[*] KÍCH HOẠT LUỒNG DETECTION - TRACKING - REID (CHIẾN LƯỢC A)")
+            print(f"[*] KÍCH HOẠT LUỒNG DETECTION - TRACKING - REID (CHIẾN LƯỢC {args.reid_strategy.upper()})")
             reid_cfg = {
+                'strategy': args.reid_strategy,
                 'num_frames': args.reid_frames,
                 'soft_lock_threshold': args.soft_lock_threshold,
                 'reid_threshold': args.reid_threshold,
@@ -617,7 +619,11 @@ def main():
         summary[dname] = {}
 
         for mname, model_fn in models_to_run:
-            effective_mname = f"{mname}+ReID" if (args.use_reid and reid_mgr is not None) else mname
+            if args.use_reid and reid_mgr is not None:
+                strat_tag = f"-{args.reid_strategy.upper()}" if args.reid_strategy.upper() != 'A' else ""
+                effective_mname = f"{mname}+ReID{strat_tag}"
+            else:
+                effective_mname = mname
             print(f"\n---> Khởi động mô hình: {effective_mname} trên {dname}...")
             tracker = None  # Khởi tạo lười (lazy load) chỉ khi cần chạy GPU
             

@@ -298,15 +298,17 @@ class IntegratedTrackerOrchestrator:
         self.cfg = cfg or {}
 
         # Các siêu tham số
+        self.strategy = str(self.cfg.get('strategy', 'B')).upper()
         self.num_frames = self.cfg.get('num_frames', 12)
         self.stride = self.cfg.get('stride', 2)
         self.bbox_padding = self.cfg.get('bbox_padding', 0.2)
         self.soft_lock_threshold = self.cfg.get('soft_lock_threshold', 0.30)
-        self.reid_threshold = self.cfg.get('reid_threshold', 0.75)
+        self.reid_threshold = self.cfg.get('reid_threshold', 0.70)
         self.update_interval_sec = self.cfg.get('update_interval_sec', 2.0)
 
         # Trạng thái và bộ nhớ
         self.state = self.T0_INIT
+        self.shadow_tracking_active = False
         self.memory_bank = TwoTierMemoryBank(
             max_anchor=self.cfg.get('max_anchor_size', 5),
             max_recent=self.cfg.get('max_recent_size', 15)
@@ -319,9 +321,11 @@ class IntegratedTrackerOrchestrator:
 
         # Thống kê telemetry
         self.stats = {
+            "strategy": self.strategy,
             "lost_frames": 0,
             "search_frames": 0,
             "tracking_frames": 0,
+            "shadow_frames": 0,
             "hard_locks": 0,
             "false_alarms": 0,
             "reid_latencies": [],
@@ -329,6 +333,7 @@ class IntegratedTrackerOrchestrator:
 
     def _transition_to_lost(self, frame_idx):
         self.state = self.T1_LOST
+        self.shadow_tracking_active = False
         self.sliding_window.clear()
         self.soft_lock_buffer.clear()
 
@@ -336,7 +341,7 @@ class IntegratedTrackerOrchestrator:
         """
         Xử lý từng frame video.
         Trả về:
-          predicted_box: [x, y, w, h] (hoặc [0, 0, 0, 0] nếu vắng mặt / đang search)
+          predicted_box: [x, y, w, h]
           state: trạng thái FSM hiện tại
           fine_score: điểm ReID (nếu có xác thực)
         """
@@ -363,6 +368,7 @@ class IntegratedTrackerOrchestrator:
                     self.sliding_window.add(feat, sharpness)
 
                 self.state = self.T3_TRACKING
+                self.shadow_tracking_active = False
                 self.last_update_time = current_time
                 self.stats["tracking_frames"] += 1
                 return predicted_box, self.state, 1.0
@@ -418,6 +424,7 @@ class IntegratedTrackerOrchestrator:
                 # UAV tái xuất hiện từ Detector (GT proxy) -> Chuyển sang T2_SEARCH
                 self.state = self.T2_SEARCH
                 self.reappeared_frame_idx = frame_idx
+                self.shadow_tracking_active = False
                 self.soft_lock_buffer.clear()
             return [0.0, 0.0, 0.0, 0.0], self.state, None
 
@@ -431,61 +438,141 @@ class IntegratedTrackerOrchestrator:
                 self._transition_to_lost(frame_idx)
                 return [0.0, 0.0, 0.0, 0.0], self.state, None
 
-            cand_crop = crop_and_pad(frame_rgb, gt_box, self.bbox_padding)
-            if cand_crop is None:
-                return [0.0, 0.0, 0.0, 0.0], self.state, None
+            # =========================================================
+            # KỊCH BẢN B: SHADOW TRACKING (Khởi động mềm & Theo dõi sớm)
+            # =========================================================
+            if self.strategy == 'B':
+                self.stats["shadow_frames"] += 1
 
-            feat = self.reid.extract_cnn_feature(cand_crop)
-            sharpness = compute_sharpness(cand_crop)
+                # 4.1 Chưa bật Shadow Tracking (Frame đầu tiên UAV tái xuất hiện):
+                if not self.shadow_tracking_active:
+                    cand_crop = crop_and_pad(frame_rgb, gt_box, self.bbox_padding)
+                    if cand_crop is None:
+                        return [0.0, 0.0, 0.0, 0.0], self.state, None
 
-            # Cấp 1: Lọc Thô (Coarse Verification)
-            if self.memory_bank.is_empty():
-                coarse_score = 1.0
+                    feat = self.reid.extract_cnn_feature(cand_crop)
+                    sharpness = compute_sharpness(cand_crop)
+
+                    # Cấp 1: Lọc Thô (Coarse Verification)
+                    if self.memory_bank.is_empty():
+                        coarse_score = 1.0
+                    else:
+                        coarse_score = self.memory_bank.coarse_score(feat)
+
+                    if coarse_score >= self.soft_lock_threshold:
+                        # Coarse đạt ngưỡng -> BẬT NGAY TRACKER TẠI BBOX NÀY (SHADOW MODE)
+                        cand_box = [float(v) for v in gt_box[:4]]
+                        self.tracker.initialize(frame_rgb, {'init_bbox': cand_box})
+                        self.shadow_tracking_active = True
+                        self.soft_lock_buffer.add(feat, sharpness)
+                        predicted_box = cand_box
+                        return predicted_box, self.state, None
+                    else:
+                        # Coarse không đạt -> Giữ trạng thái tìm kiếm
+                        return [0.0, 0.0, 0.0, 0.0], self.state, None
+
+                # 4.2 Đang trong chế độ Shadow Tracking (Theo dõi và thu thập k frames):
+                else:
+                    out = self.tracker.track(frame_rgb)
+                    track_box = [float(v) for v in out['target_bbox']]
+                    predicted_box = track_box
+
+                    crop = crop_and_pad(frame_rgb, track_box, self.bbox_padding)
+                    if crop is not None:
+                        feat = self.reid.extract_cnn_feature(crop)
+                        sharpness = compute_sharpness(crop)
+                        self.soft_lock_buffer.add(feat, sharpness)
+
+                    # Khi Soft Lock Buffer gom đủ k frames -> Mamba Lọc Tinh
+                    if self.soft_lock_buffer.is_ready():
+                        bundle = self.reid.compute_fused_vector(self.soft_lock_buffer)
+                        if self.memory_bank.is_empty():
+                            fine_score = 1.0
+                        else:
+                            fine_score = self.memory_bank.fine_score(bundle.fused_feat)
+
+                        fine_score_ret = fine_score
+
+                        if fine_score >= self.reid_threshold:
+                            # HARD LOCK THÀNH CÔNG -> Thăng cấp chính thức thành T3_TRACKING
+                            self.state = self.T3_TRACKING
+                            self.shadow_tracking_active = False
+
+                            latency = frame_idx - self.reappeared_frame_idx
+                            self.stats["reid_latencies"].append(latency)
+                            self.stats["hard_locks"] += 1
+
+                            self.memory_bank.add_recent(bundle.visual_mean, bundle.fused_feat,
+                                                        bundle.temporal_token, bundle.visual_plain, bundle.raw_feat)
+                            self.sliding_window = self.soft_lock_buffer
+                            self.sliding_window.stride = self.stride
+                            self.soft_lock_buffer = SlidingWindowBuffer(self.num_frames, stride=1)
+                            self.last_update_time = current_time
+
+                            return predicted_box, self.state, fine_score_ret
+                        else:
+                            # FALSE ALARM: Bám nhầm đối tượng lạ -> HỦY TRACKER, quay về T1_LOST
+                            self.stats["false_alarms"] += 1
+                            self.shadow_tracking_active = False
+                            self._transition_to_lost(frame_idx)
+                            return [0.0, 0.0, 0.0, 0.0], self.state, fine_score_ret
+
+                    # Trong khi chưa đủ k frames, tiếp tục xuất box bám của shadow tracking
+                    return predicted_box, self.state, None
+
+            # =========================================================
+            # KỊCH BẢN A: STRICT REID (An toàn tuyệt đối, xuất [0,0,0,0])
+            # =========================================================
             else:
-                coarse_score = self.memory_bank.coarse_score(feat)
+                cand_crop = crop_and_pad(frame_rgb, gt_box, self.bbox_padding)
+                if cand_crop is None:
+                    return [0.0, 0.0, 0.0, 0.0], self.state, None
 
-            if len(self.soft_lock_buffer.features) > 0:
-                self.soft_lock_buffer.add(feat, sharpness)
-            elif coarse_score >= self.soft_lock_threshold:
-                self.soft_lock_buffer.add(feat, sharpness)
+                feat = self.reid.extract_cnn_feature(cand_crop)
+                sharpness = compute_sharpness(cand_crop)
 
-            # Cấp 2: Lọc Tinh (Khi Soft Lock Buffer đủ k frames)
-            if self.soft_lock_buffer.is_ready():
-                bundle = self.reid.compute_fused_vector(self.soft_lock_buffer)
                 if self.memory_bank.is_empty():
-                    fine_score = 1.0
+                    coarse_score = 1.0
                 else:
-                    fine_score = self.memory_bank.fine_score(bundle.fused_feat)
+                    coarse_score = self.memory_bank.coarse_score(feat)
 
-                fine_score_ret = fine_score
+                if len(self.soft_lock_buffer.features) > 0:
+                    self.soft_lock_buffer.add(feat, sharpness)
+                elif coarse_score >= self.soft_lock_threshold:
+                    self.soft_lock_buffer.add(feat, sharpness)
 
-                # Ngưỡng HARD LOCK
-                if fine_score >= self.reid_threshold:
-                    # XÁC THỰC THÀNH CÔNG -> KÍCH HOẠT LẠI TRACKER TẠI VỊ TRÍ NÀY
-                    verified_box = [float(v) for v in gt_box[:4]]
-                    self.tracker.initialize(frame_rgb, {'init_bbox': verified_box})
-                    predicted_box = verified_box
+                if self.soft_lock_buffer.is_ready():
+                    bundle = self.reid.compute_fused_vector(self.soft_lock_buffer)
+                    if self.memory_bank.is_empty():
+                        fine_score = 1.0
+                    else:
+                        fine_score = self.memory_bank.fine_score(bundle.fused_feat)
 
-                    latency = frame_idx - self.reappeared_frame_idx
-                    self.stats["reid_latencies"].append(latency)
-                    self.stats["hard_locks"] += 1
+                    fine_score_ret = fine_score
 
-                    self.memory_bank.add_recent(bundle.visual_mean, bundle.fused_feat,
-                                                bundle.temporal_token, bundle.visual_plain, bundle.raw_feat)
-                    self.sliding_window = self.soft_lock_buffer
-                    self.sliding_window.stride = self.stride
-                    self.soft_lock_buffer = SlidingWindowBuffer(self.num_frames, stride=1)
+                    if fine_score >= self.reid_threshold:
+                        verified_box = [float(v) for v in gt_box[:4]]
+                        self.tracker.initialize(frame_rgb, {'init_bbox': verified_box})
+                        predicted_box = verified_box
 
-                    self.state = self.T3_TRACKING
-                    self.last_update_time = current_time
-                    return predicted_box, self.state, fine_score_ret
-                else:
-                    # Xác thực thất bại (False Alarm)
-                    self.stats["false_alarms"] += 1
-                    self.soft_lock_buffer.features.pop(0)
-                    self.soft_lock_buffer.sharpness_scores.pop(0)
+                        latency = frame_idx - self.reappeared_frame_idx
+                        self.stats["reid_latencies"].append(latency)
+                        self.stats["hard_locks"] += 1
 
-            # Trong Chiến lược A: Trong quá trình Search chờ đủ frame, không xuất box giả để tránh drift
-            return [0.0, 0.0, 0.0, 0.0], self.state, fine_score_ret
+                        self.memory_bank.add_recent(bundle.visual_mean, bundle.fused_feat,
+                                                    bundle.temporal_token, bundle.visual_plain, bundle.raw_feat)
+                        self.sliding_window = self.soft_lock_buffer
+                        self.sliding_window.stride = self.stride
+                        self.soft_lock_buffer = SlidingWindowBuffer(self.num_frames, stride=1)
+
+                        self.state = self.T3_TRACKING
+                        self.last_update_time = current_time
+                        return predicted_box, self.state, fine_score_ret
+                    else:
+                        self.stats["false_alarms"] += 1
+                        self.soft_lock_buffer.features.pop(0)
+                        self.soft_lock_buffer.sharpness_scores.pop(0)
+
+                return [0.0, 0.0, 0.0, 0.0], self.state, fine_score_ret
 
         return [0.0, 0.0, 0.0, 0.0], self.state, None
